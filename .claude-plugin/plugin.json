@@ -7,5 +7,20 @@
     "name": "Joshua Smith"
   },
   "repository": "https://github.com/JSmithRobotics/claude-pr-tracker",
-  "license": "MIT"
+  "license": "MIT",
+  "userConfig": {
+    "requestsPerHour": {
+      "type": "number",
+      "title": "GitHub requests per hour",
+      "description": "The most gh requests the tracker makes in any hour, shared by every Claude session on this machine. Each request fetches every due PR at once.",
+      "default": 60,
+      "min": 1
+    },
+    "daemonCommand": {
+      "type": "string",
+      "title": "Daemon command",
+      "description": "A command that, when it answers `ping`, takes over fetching (`fetch` reads a request on stdin and prints the response). Empty to always use the built-in coordinator.",
+      "default": "pr-tracker-daemon"
+    }
+  }
 }

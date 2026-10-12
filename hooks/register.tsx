@@ -1,17 +1,22 @@
 import { atom, read, update } from 'claude-code'
 import type { CommandPresentation, EngineInterface as Engine, Register, RenderSurface } from 'claude-code'
 
-import type { TrackedPr } from '../types'
+import type { FetchRequest, FetchResponse, TrackedPr } from '../types'
+import { answerOf, asFetchResponse, batchQuery, dueKeys, holdOf, parseBatch, parseState, recordBatch, repoFromRemotes } from './fetcher.ts'
+
+export { summarise } from './fetcher.ts'
 
 const PANE = 'pr-tracker'
 const POLL_MS = 60_000
+/** How stale an open PR with no running checks may get before it is fetched again. */
+const QUIET_POLL_MS = 5 * 60_000
 /** The terminal width from which the fullscreen layout docks a pane beside the transcript. */
 const DOCK_COLUMNS = 110
 /** Below this many body columns the pane drops its cards and header for one line per PR. */
 const MINIMAL_COLUMNS = 48
-const FIELDS = 'number,title,url,state,isDraft,mergeable,reviewDecision,statusCheckRollup'
 
 const prs = atom({ plugin: 'pr-tracker', key: 'prs' } as const, [] as TrackedPr[])
+const chipOffset = atom({ plugin: 'pr-tracker', key: 'chipOffset' } as const, 0)
 
 type Ref = { repo?: string; number: number }
 
@@ -38,50 +43,30 @@ export function refFromArg(arg: string): Ref | undefined {
   return m ? { repo: m[1], number: Number(m[2]) } : undefined
 }
 
-type Check = { name?: string; context?: string; status?: string; conclusion?: string; state?: string }
-
-/** Buckets a statusCheckRollup: check runs by status/conclusion, commit statuses by state. */
-export function summarise(rollup: readonly Check[]) {
-  const out = { pass: 0, fail: 0, pending: 0, skipped: 0, failing: [] as string[], running: [] as string[] }
-  for (const c of rollup) {
-    const name = c.name ?? c.context ?? '?'
-    const verdict =
-      c.state !== undefined
-        ? c.state === 'SUCCESS'
-          ? 'pass'
-          : c.state === 'PENDING' || c.state === 'EXPECTED'
-            ? 'pending'
-            : 'fail'
-        : c.status !== 'COMPLETED'
-          ? 'pending'
-          : c.conclusion === 'SUCCESS' || c.conclusion === 'NEUTRAL'
-            ? 'pass'
-            : c.conclusion === 'SKIPPED'
-              ? 'skipped'
-              : 'fail'
-    out[verdict] += 1
-    if (verdict === 'fail') out.failing.push(name)
-    if (verdict === 'pending') out.running.push(name)
-  }
-  return out
-}
-
 let cwdRepo: string | undefined
 let refreshing = false
+let requestsPerHour = 60
+/** The daemon command when it answered `ping` at session start; otherwise the built-in coordinator fetches. */
+let daemonCommand: string | undefined
+/** This session's name on the shared lock. */
+const lockOwner = Math.random().toString(36).slice(2)
+/** Set while the budget or GitHub holds fetches back. */
+let limited: { until: number; reason: string } | undefined
 /** Whether a clickable summary under the prompt stands in for the status line. */
 let summaryInHint = false
 /** The terminal's layout as last seen, for presses that come with no `presentation`. */
 let terminalLayout: CommandPresentation | undefined
 
-async function gh($: Engine, argv: string[]) {
-  return $.process.run(['gh', ...argv], { timeoutMs: 30_000 })
-}
-
+/** The cwd's GitHub repo as gh resolves it, from git's own config, which costs no API request. */
 async function resolveRepo($: Engine, repo?: string): Promise<string | undefined> {
   if (repo) return repo
   if (cwdRepo) return cwdRepo
-  const r = await gh($, ['repo', 'view', '--json', 'nameWithOwner', '-q', '.nameWithOwner'])
-  if (r.exitCode === 0 && r.stdout.trim()) cwdRepo = r.stdout.trim()
+  try {
+    const r = await $.process.run(['git', 'config', '--get-regexp', '^remote\\.'], { timeoutMs: 5_000 })
+    if (r.exitCode === 0) cwdRepo = repoFromRemotes(r.stdout)
+  } catch {
+    cwdRepo = undefined
+  }
   return cwdRepo
 }
 
@@ -93,26 +78,135 @@ function blank(repo: string, number: number): TrackedPr {
   }
 }
 
-async function fetchPr($: Engine, pr: TrackedPr): Promise<TrackedPr> {
+/** How stale a PR may be before it is due: undefined once a merged or closed PR has been fetched. */
+export function maxAgeMs(p: TrackedPr): number | undefined {
+  if (p.checkedAt === 0 || p.state === 'UNKNOWN' || p.pending > 0) return POLL_MS
+  if (p.state === 'MERGED' || p.state === 'CLOSED') return undefined
+  return QUIET_POLL_MS
+}
+
+const GH_TIMEOUT_MS = 30_000
+/** Outlasts a gh call, so a live holder never loses the lock mid-fetch. */
+const LEASE_MS = 45_000
+
+async function cacheDir($: Engine): Promise<string> {
+  const own = await $.env.get('CLAUDE_PR_TRACKER_DIR')
+  if (own) return own
+  const local = await $.env.get('LOCALAPPDATA')
+  if (local) return `${local}/claude-pr-tracker`
+  const xdg = await $.env.get('XDG_CACHE_HOME')
+  if (xdg) return `${xdg}/claude-pr-tracker`
+  const home = (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE')) ?? '.'
+  return `${home}/.cache/claude-pr-tracker`
+}
+
+async function readJson($: Engine, path: string): Promise<unknown> {
   try {
-    const r = await gh($, ['pr', 'view', String(pr.number), '-R', pr.repo, '--json', FIELDS])
-    if (r.exitCode !== 0) return { ...pr, error: r.stderr.trim().split('\n')[0] || `gh exited ${r.exitCode}` }
-    const j = JSON.parse(r.stdout)
-    return {
-      ...pr,
-      title: j.title ?? pr.title,
-      url: j.url ?? pr.url,
-      state: j.state ?? pr.state,
-      isDraft: Boolean(j.isDraft),
-      mergeable: j.mergeable ?? 'UNKNOWN',
-      review: j.reviewDecision ?? '',
-      ...summarise(j.statusCheckRollup ?? []),
-      checkedAt: await $.clock.now(),
-      error: undefined,
-    }
-  } catch (err) {
-    return { ...pr, error: String(err).slice(0, 120) }
+    return JSON.parse(await $.fs.read(path))
+  } catch {
+    return undefined
   }
+}
+
+/** The shared state file: empty when missing, `corrupt` when it exists but does not parse (mid-write). */
+async function readShared($: Engine, path: string): Promise<ReturnType<typeof parseState> | 'corrupt'> {
+  let text: string
+  try {
+    text = await $.fs.read(path)
+  } catch {
+    return parseState(undefined)
+  }
+  try {
+    return parseState(JSON.parse(text))
+  } catch {
+    return 'corrupt'
+  }
+}
+
+let coordinatorTail: Promise<unknown> = Promise.resolve()
+
+/**
+ * The built-in coordinator: every session on the machine shares one request budget and one cache of
+ * PR results through files in the cache dir. Only `$.fs` and `gh` are used, so it runs on Linux,
+ * macOS and Windows alike. Within a session fetches queue; across sessions the lock is a lease
+ * written then read back, not an atomic primitive, so two sessions racing for it can both fetch.
+ * Each applies its batch to the state it re-reads just before writing, so a race costs a request,
+ * and a state file caught mid-write is never taken for an empty one.
+ */
+function viaCoordinator($: Engine, request: FetchRequest): Promise<FetchResponse> {
+  const run = coordinatorTail.then(() => coordinate($, request))
+  coordinatorTail = run.catch(() => undefined)
+  return run
+}
+
+async function coordinate($: Engine, request: FetchRequest): Promise<FetchResponse> {
+  const dir = await cacheDir($)
+  const statePath = `${dir}/state.json`
+  const lockPath = `${dir}/lock.json`
+  const now = await $.clock.now()
+  const first = await readShared($, statePath)
+  let state = first === 'corrupt' ? parseState(undefined) : first
+  const hold = () => holdOf(state, now, requestsPerHour)
+  if (first === 'corrupt' || dueKeys(state, request, now).length === 0 || hold().limitedUntil) {
+    return answerOf(state, request, hold())
+  }
+  const lock = (await readJson($, lockPath)) as { owner?: string; until?: number } | undefined
+  if (lock?.owner && lock.owner !== lockOwner && (lock.until ?? 0) > now) return answerOf(state, request, hold())
+  await $.fs.write(lockPath, JSON.stringify({ owner: lockOwner, until: now + LEASE_MS }))
+  if (((await readJson($, lockPath)) as { owner?: string } | undefined)?.owner !== lockOwner) {
+    return answerOf(state, request, hold())
+  }
+  try {
+    const locked = await readShared($, statePath)
+    if (locked === 'corrupt') return answerOf(state, request, hold())
+    state = locked
+    const keys = dueKeys(state, request, now)
+    if (keys.length === 0 || hold().limitedUntil) return answerOf(state, request, hold())
+    let ran
+    try {
+      ran = await $.process.run(['gh', 'api', 'graphql', '-f', `query=${batchQuery(keys)}`], { timeoutMs: GH_TIMEOUT_MS })
+    } catch (err) {
+      ran = { exitCode: 1, stdout: '', stderr: String(err).slice(0, 120) }
+    }
+    const latest = await readShared($, statePath)
+    state = recordBatch(latest === 'corrupt' ? state : latest, parseBatch(ran, keys, now), now)
+    await $.fs.write(statePath, JSON.stringify(state))
+    return answerOf(state, request, hold())
+  } finally {
+    if (((await readJson($, lockPath)) as { owner?: string } | undefined)?.owner === lockOwner) {
+      await $.fs.write(lockPath, JSON.stringify({ owner: '', until: 0 }))
+    }
+  }
+}
+
+/** Whether `command ping` answers, so a daemon takes the fetching. */
+async function daemonAnswers($: Engine, command: string): Promise<boolean> {
+  if (!command) return false
+  try {
+    return (await $.process.run([command, 'ping'], { timeoutMs: 2_000 })).exitCode === 0
+  } catch {
+    return false
+  }
+}
+
+/** The daemon's answer to `request` on `command fetch`, or undefined when it fails. */
+async function viaDaemon($: Engine, command: string, request: FetchRequest): Promise<FetchResponse | undefined> {
+  try {
+    const r = await $.process.run([command, 'fetch'], { stdin: JSON.stringify(request), timeoutMs: GH_TIMEOUT_MS + 5_000 })
+    return r.exitCode === 0 ? asFetchResponse(JSON.parse(r.stdout)) : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function apply(list: TrackedPr[], response: FetchResponse): TrackedPr[] {
+  return list.map(p => {
+    const got = response.prs[p.key]
+    if (!got || (p.checkedAt !== 0 && got.fetchedAt <= p.checkedAt)) return p
+    return got.data
+      ? { ...p, ...got.data, url: got.data.url || p.url, checkedAt: got.fetchedAt, error: undefined }
+      : { ...p, checkedAt: got.fetchedAt, error: got.error }
+  })
 }
 
 async function track($: Engine, refs: Ref[]) {
@@ -126,23 +220,32 @@ async function track($: Engine, refs: Ref[]) {
   }
   if (added.length === 0) return
   await update($, prs, list => [...list, ...added])
-  await refresh($, added.map(p => p.key))
+  await refresh($, { keys: added.map(p => p.key) })
 }
 
-async function refresh($: Engine, keys?: string[]) {
-  if (refreshing && !keys) return
-  if (!keys) refreshing = true
+/**
+ * Fetches what is due through the fetcher: by default every tracked PR past its maxAgeMs; `keys`
+ * narrows that; `force` asks for those PRs fresh, still within the budget.
+ */
+async function refresh($: Engine, { keys, force }: { keys?: string[]; force?: boolean } = {}) {
+  if (!keys && !force && refreshing) return
+  if (!keys && !force) refreshing = true
   try {
-    const list = await read($, prs)
-    // A merged or closed PR settles; one fetch after it settled is enough.
-    const due = list.filter(p =>
-      keys ? keys.includes(p.key) : !(p.state === 'MERGED' || p.state === 'CLOSED') || p.checkedAt === 0,
-    )
-    const fresh = await Promise.all(due.map(p => fetchPr($, p)))
-    await update($, prs, current => current.map(p => fresh.find(f => f.key === p.key) ?? p))
+    const request = (await read($, prs)).flatMap(p => {
+      const age = force ? 0 : maxAgeMs(p)
+      return age === undefined || (keys && !keys.includes(p.key)) ? [] : [{ key: p.key, maxAgeMs: age }]
+    })
+    if (request.length === 0) return
+    const ask: FetchRequest = { version: 1, requestsPerHour, prs: request }
+    let response: FetchResponse | undefined
+    if (daemonCommand) response = await viaDaemon($, daemonCommand, ask)
+    response ??= await viaCoordinator($, ask)
+    limited = response.limitedUntil ? { until: response.limitedUntil, reason: response.reason ?? '' } : undefined
+    if (force && limited) $.ui.toast(`gh is held back (${limited.reason}) for ${until(await $.clock.now(), limited.until)}.`)
+    await update($, prs, list => apply(list, response))
     await showStatus($)
   } finally {
-    if (!keys) refreshing = false
+    if (!keys && !force) refreshing = false
   }
 }
 
@@ -260,6 +363,11 @@ export function plan(live: TrackedPr[], settled: TrackedPr[], rows: number): Lay
   return { full, doneLines, height }
 }
 
+function until(now: number, at: number) {
+  const m = Math.max(1, Math.ceil((at - now) / 60_000))
+  return m < 60 ? `${m}m` : `${Math.round(m / 60)}h`
+}
+
 function ago(now: number, at: number) {
   if (!at) return 'never'
   const s = Math.max(0, Math.round((now - at) / 1000))
@@ -267,27 +375,58 @@ function ago(now: number, at: number) {
 }
 
 /**
- * Whether the pane would dock on the right. Panes are session-wide and an inline terminal seat
- * closes the pane, so an attached terminal decides (its fullscreen layout from DOCK_COLUMNS wide);
- * without one, an attached desktop or IDE docks it. `at` describes the terminal alone.
+ * Whether the pane may open. Panes are session-wide and a narrow fullscreen terminal closes the pane
+ * rather than seat it inline, so an attached terminal decides: classic (main screen) mode opens it
+ * inline above the prompt, fullscreen docks it on the right from DOCK_COLUMNS wide. Without one, an
+ * attached desktop or IDE docks it. `at` describes the terminal alone.
  */
-export function docks(at: CommandPresentation | undefined, surfaces: readonly RenderSurface[]): boolean {
-  if (surfaces.includes('terminal')) return at?.isFullscreen === true && at.columns >= DOCK_COLUMNS
+export function opens(at: CommandPresentation | undefined, surfaces: readonly RenderSurface[]): boolean {
+  if (surfaces.includes('terminal')) return at !== undefined && (!at.isFullscreen || at.columns >= DOCK_COLUMNS)
   return surfaces.some(s => s === 'desktop' || s === 'vscode')
 }
 
-/** Why the pane will not open, or undefined when it docks. */
-async function dockRefusal($: Engine, at: CommandPresentation | undefined): Promise<string | undefined> {
-  if (docks(at, await $.session.surfaces())) return undefined
-  const now = at?.isFullscreen ? `${at.columns} columns` : 'main screen'
-  return `The PR pane docks on the right only: it needs the fullscreen layout and ${DOCK_COLUMNS} columns (now ${now}). The status line still tracks.`
+/** Why the pane will not open, or undefined when it opens. */
+async function openRefusal($: Engine, at: CommandPresentation | undefined): Promise<string | undefined> {
+  if (opens(at, await $.session.surfaces())) return undefined
+  const now = at ? `now ${at.columns}` : 'the terminal has not said how wide it is'
+  return `In fullscreen the PR pane docks on the right only, from ${DOCK_COLUMNS} columns (${now}). The status line still tracks.`
 }
 
-/** The pane is only ever a right-hand dock; where nothing would dock it, it stays shut. */
-async function openPane($: Engine, at: CommandPresentation | undefined): Promise<string | undefined> {
+/** Cells of the inline row outside the chips: title, both scroll buttons with counts, close. */
+const INLINE_CHROME = 28
+
+/** Cells one PR chip takes inline: glyph, `#n`, CI tally, untrack button and the gap after it. */
+function chipWidth(p: TrackedPr): number {
+  const ci = p.pass + p.fail + p.pending + p.skipped
+  const tally = ci > 0 ? ` ${p.pass + p.fail + p.skipped}/${ci}` : ''
+  return 2 + 1 + String(p.number).length + tally.length + 2 + 2
+}
+
+/**
+ * The chips shown from `offset` (clamped to the list) in `room` cells: always one, then whole chips
+ * while they fit; at the end of the list it backs up over earlier chips that still fit.
+ */
+export function chipWindow(widths: readonly number[], offset: number, room: number) {
+  let start = Math.max(0, Math.min(offset, widths.length - 1))
+  let end = start
+  let used = 0
+  while (end < widths.length && (end === start || used + (widths[end] ?? 0) <= room)) {
+    used += widths[end] ?? 0
+    end += 1
+  }
+  while (end === widths.length && start > 0 && used + (widths[start - 1] ?? 0) <= room) {
+    start -= 1
+    used += widths[start] ?? 0
+  }
+  return { start, end }
+}
+
+async function openPane($: Engine, at: CommandPresentation | undefined, focus?: true): Promise<string | undefined> {
   terminalLayout = at ?? terminalLayout
-  const refused = await dockRefusal($, terminalLayout)
-  if (!refused) await $.ui.open({ id: PANE, title: 'Pull requests' })
+  const refused = await openRefusal($, terminalLayout)
+  if (!refused) {
+    await $.ui.open({ id: PANE, title: 'Pull requests', rows: 1, ...(focus ? { focus } : {}) })
+  }
   return refused
 }
 
@@ -299,12 +438,16 @@ async function isPaneOpen($: Engine) {
   return (await $.ui.panes()).some(p => p.id === PANE)
 }
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  requestsPerHour = Math.max(1, Number(options.requestsPerHour ?? 60))
+  const daemonName = String(options.daemonCommand ?? 'pr-tracker-daemon')
+
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'prs',
       description: 'Track PRs: /prs [add <n|url> | remove <n> | clear | refresh]',
     })
+    daemonCommand = (await daemonAnswers($, daemonName)) ? daemonName : undefined
     $.clock.every(POLL_MS, () => void refresh($))
     void showStatus($)
     return next(e)
@@ -330,7 +473,7 @@ export const register: Register = on => {
       return { text: 'Cleared the tracked PRs.' }
     }
     if (verb === 'refresh' || verb === '') {
-      void refresh($)
+      void refresh($, { force: true })
       const refused = await openPane($, e.presentation)
       if (verb) return { text: refused ? `Refreshing the tracked PRs. ${refused}` : 'Refreshing the tracked PRs.' }
       return { text: refused ?? 'PR tracker opened.' }
@@ -343,15 +486,9 @@ export const register: Register = on => {
     const command = e.command
     const refs = refsInCommand(command)
     if (PR_CREATE.test(command) && ran.deny === undefined && ran.isError !== true) {
-      // The new PR is the current branch's; gh resolves it from where the session runs.
-      void gh($, ['pr', 'view', '--json', 'number,url'])
-        .then(r => {
-          if (r.exitCode !== 0) return
-          const j = JSON.parse(r.stdout)
-          const url = [...String(j.url).matchAll(PR_URL)][0]
-          return track($, [{ repo: url?.[1], number: Number(j.number) }])
-        })
-        .catch(() => undefined)
+      // gh pr create prints the new PR's URL, so naming it costs no API request.
+      const stdout = String((ran.result as { stdout?: unknown } | undefined)?.stdout ?? '')
+      for (const m of stdout.matchAll(PR_URL)) refs.push({ repo: m[1], number: Number(m[2]) })
     }
     if (refs.length > 0) void track($, refs)
     return ran
@@ -372,9 +509,8 @@ export const register: Register = on => {
     const { Box, Button } = $.ui.resolve(e)
     const toggle = async () => {
       if (await isPaneOpen($)) return closePane($)
-      const refused = await dockRefusal($, terminalLayout)
-      if (refused) return $.ui.toast(refused)
-      await $.ui.open({ id: PANE, title: 'Pull requests', focus: true })
+      const refused = await openPane($, undefined, true)
+      if (refused) $.ui.toast(refused)
     }
     return (
       <Box justifyContent="space-between">
@@ -388,11 +524,12 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Link, Button } = $.ui.resolve(e)
-    // The terminal reseats a docked pane inline when it narrows below DOCK_COLUMNS. Placement is
-    // per surface, so a phone seating its copy inline must not close the terminal's dock.
-    if (e.props.placement === 'inline') {
-      if (e.surface === 'terminal') void closePane($)
-      return <Text color="inactive">The PR pane docks on the right only.</Text>
+    // A fullscreen terminal reseats a docked pane inline when it narrows below DOCK_COLUMNS. Placement
+    // is per surface, so only that terminal closes it; classic mode and phones draw it inline.
+    const inline = e.props.placement === 'inline'
+    if (inline && e.surface === 'terminal' && e.viewport?.isFullscreen === true) {
+      void closePane($)
+      return <Text color="inactive">In fullscreen the PR pane docks on the right only.</Text>
     }
     const list = await read($, prs)
     const now = await $.clock.now()
@@ -401,7 +538,7 @@ export const register: Register = on => {
 
     const controls = (
       <Box>
-        <Button key="refresh" plain dimColor hotkey="r" onPress={() => void refresh($)}>refresh</Button>
+        <Button key="refresh" plain dimColor hotkey="r" onPress={() => void refresh($, { force: true })}>refresh</Button>
         <Text>  </Text>
         <Button key="close" plain dimColor hotkey="x" role="dismiss" onPress={() => void closePane($)}>close</Button>
       </Box>
@@ -409,6 +546,42 @@ export const register: Register = on => {
     const untrackButton = (p: TrackedPr) => (
       <Button key={`untrack:${p.key}`} plain dimColor onPress={() => void untrack($, q => q.key === p.key)}>✕</Button>
     )
+
+    if (inline) {
+      const chips = [...list].sort((x, y) => ORDER.indexOf(health(x)) - ORDER.indexOf(health(y)))
+      const { start, end } = chipWindow(chips.map(chipWidth), await read($, chipOffset), e.props.bodyColumns - INLINE_CHROME)
+      return (
+        <Box>
+          <Text bold color="claude">⌥ PRs </Text>
+          {start > 0 ? (
+            <Button key="chips-prev" plain dimColor hotkey="h" onPress={() => void update($, chipOffset, () => start - 1)}>‹ {start}</Button>
+          ) : null}
+          <Box flexGrow={1}>
+            {chips.length === 0 ? <Text color="inactive"> none tracked: /prs add 123</Text> : null}
+            {chips.slice(start, end).map(p => {
+              const kind = health(p)
+              const ci = p.pass + p.fail + p.pending + p.skipped
+              return (
+                <Box marginLeft={1} marginRight={1} flexShrink={1}>
+                  <Text wrap="truncate-end">
+                    <Text color={ACCENT[kind]} bold>{GLYPH[kind]} </Text>
+                    <Link href={p.url}><Text bold color={kind === 'merged' || kind === 'closed' ? 'inactive' : 'suggestion'}>#{p.number}</Text></Link>
+                    {ci > 0 ? <Text color="inactive"> {p.pass + p.fail + p.skipped}/{ci}</Text> : null}
+                    <Text> </Text>
+                  </Text>
+                  {untrackButton(p)}
+                </Box>
+              )
+            })}
+          </Box>
+          {end < chips.length ? (
+            <Button key="chips-next" plain dimColor hotkey="l" onPress={() => void update($, chipOffset, () => start + 1)}>{chips.length - end} ›</Button>
+          ) : null}
+          <Text>  </Text>
+          <Button key="close" plain dimColor hotkey="x" role="dismiss" onPress={() => void closePane($)}>✕</Button>
+        </Box>
+      )
+    }
 
     if (list.length === 0) {
       return (
@@ -490,6 +663,7 @@ export const register: Register = on => {
           </Text>
           <Text color="inactive">
             {layout.height > room ? (e.props.isFocused ? '↑↓ scroll  ' : 'ctrl+x tab ↕  ') : ''}↻ {ago(now, newest)}
+            {limited && limited.until > now ? ` · gh paused ${until(now, limited.until)}` : ''}
           </Text>
         </Box>
 
@@ -551,7 +725,7 @@ export const register: Register = on => {
                 <Box>
                   <Link href={`${p.url}/checks`}><Text color="suggestion">checks</Text></Link>
                   <Text> </Text>
-                  <Button key={`refresh:${p.key}`} plain dimColor onPress={() => void refresh($, [p.key])}>↻</Button>
+                  <Button key={`refresh:${p.key}`} plain dimColor onPress={() => void refresh($, { keys: [p.key], force: true })}>↻</Button>
                   <Text> </Text>
                   {untrackButton(p)}
                 </Box>
