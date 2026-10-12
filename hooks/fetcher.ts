@@ -87,7 +87,11 @@ export function parseBatch(r: Ran, keys: readonly string[], now: number): { prs:
   for (const [i, key] of keys.entries()) {
     const pr = body?.data?.[`p${i}`]?.pullRequest
     const error = body?.errors?.find(e => e.path?.[0] === `p${i}`)?.message
-    prs[key] = pr ? { fetchedAt: now, data: prData(pr) } : { fetchedAt: now, error: error ?? (body?.data ? 'not found' : failure) }
+    prs[key] = pr
+      ? { fetchedAt: now, data: prData(pr) }
+      : body?.data
+        ? { fetchedAt: now, error: error ?? 'not found' }
+        : { fetchedAt: now, error: failure, transient: true }
   }
   const limit = body?.data?.rateLimit
   const reset = Date.parse(limit?.resetAt ?? '')

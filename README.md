@@ -30,7 +30,7 @@ Outside fullscreen the status line summarises the open PRs (`PRs 3 open · 1 fai
 ## GitHub requests
 
 - Each fetch is one `gh api graphql` call covering every due PR, whatever the repo. The repo of the working directory is the one gh resolves (a `gh repo set-default` choice, else the `upstream`, `github` or `origin` remote), read from git's config, and a PR from `gh pr create` from that command's output, so neither costs a request.
-- PRs with running checks are refetched every minute, other open PRs every 5 minutes, merged and closed ones not at all. `refresh` in the pane, its `↻` and `/prs refresh` fetch at once.
+- PRs with running checks are refetched every minute, other open PRs every 5 minutes, merged and closed ones not at all. With the pane closed and no prompt or Bash call for 10 minutes, that slows to every 5 and 25 minutes. A PR GitHub can't answer (a typo, a deleted fork) is retried after 1, 2, 4, 8 … minutes, at most hourly; gh being offline or logged out doesn't count against a PR. PRs named within a second of each other share one fetch. `refresh` in the pane, its `↻` and `/prs refresh` fetch at once.
 - Every Claude session on the machine shares one budget, `requestsPerHour` (default 60), and one cache of results. A PR another session fetched recently is not fetched again. When GitHub says the limit is spent, every session pauses until its reset, and the pane header says `gh paused 12m`.
 - The shared files live in `$CLAUDE_PR_TRACKER_DIR`, else `%LOCALAPPDATA%\claude-pr-tracker` on Windows, else `$XDG_CACHE_HOME/claude-pr-tracker` or `~/.cache/claude-pr-tracker`.
 

@@ -23,6 +23,8 @@ export type FetchedPr = {
   fetchedAt: number
   data?: PrData
   error?: string
+  /** The error was the whole request's (gh offline, auth, timeout), not this PR's, so it says nothing about the PR. */
+  transient?: boolean
 }
 
 /** Asks for each PR no older than `maxAgeMs`: what a fetcher, built in or a daemon's `fetch`, reads. */
@@ -53,6 +55,8 @@ export type TrackedPr = PrData & {
   checkedAt: number
   /** The last fetch's error, cleared by the next one that answers. */
   error?: string
+  /** Fetches in a row that answered with an error; 0 or absent once one answers with data. */
+  failures?: number
 }
 
 declare module 'claude-code' {

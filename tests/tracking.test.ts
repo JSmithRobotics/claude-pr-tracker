@@ -21,6 +21,7 @@ type World = {
   checks: unknown[]
   rateLimit: { remaining: number; resetAt: string }
   refuse: boolean
+  offline: boolean
   bashStdout: string
   daemon?: (request: { prs: { key: string; maxAgeMs: number }[] }) => unknown
   daemonRequests: unknown[]
@@ -38,7 +39,7 @@ type World = {
 function world(on: On, repo = 'kinisi-robotics/kinisi_ros'): World {
   const w: World = {
     files: new Map(), graphql: [], argv: [], statuses: [], clock: mock.clock(on, { now: Date.parse('2026-10-09T12:00:00Z') }), checks: CHECKS,
-    rateLimit: { remaining: 4999, resetAt: '2099-01-01T00:00:00Z' }, refuse: false, bashStdout: '', daemonRequests: [],
+    rateLimit: { remaining: 4999, resetAt: '2099-01-01T00:00:00Z' }, refuse: false, offline: false, bashStdout: '', daemonRequests: [],
     remotes: { origin: `git@github.com:${repo}.git` }, titles: {}, missing: [],
   }
   const ran = (stdout: string, exitCode = 0, stderr = '') =>
@@ -81,6 +82,7 @@ function world(on: On, repo = 'kinisi-robotics/kinisi_ros'): World {
       w.entered?.()
       await w.hold
       if (w.refuse) return ran('', 1, 'gh: API rate limit exceeded for user ID 1. (HTTP 403)')
+      if (w.offline) return ran('', 1, 'error connecting to api.github.com')
       const data: Record<string, unknown> = { rateLimit: w.rateLimit }
       const errors: unknown[] = []
       for (const m of query.matchAll(/(p\d+): repository\(owner: "([^"]+)", name: "([^"]+)"\) \{ pullRequest\(number: (\d+)\)/g)) {
@@ -113,8 +115,10 @@ async function start($: Engine, on: On, w: World) {
   await w.clock.settle()
 }
 
+// A Bash call, then the second in which newly named PRs are gathered into one fetch.
 async function bash($: Engine, w: World, command: string) {
   await $.tool.call({ tool: 'Bash', command })
+  await w.clock.advance(1_000)
   await w.clock.settle()
 }
 
@@ -408,6 +412,7 @@ test('the hourly budget is shared through the cache and refills as requests age 
 
 test('GitHub running out or refusing pauses fetching until its reset', async ($, on) => {
   const w = world(on, 'o/r')
+  panes(on).add('pr-tracker')
   await start($, on, w)
   w.rateLimit = { remaining: 0, resetAt: new Date(w.clock.now() + 10 * 60_000).toISOString() }
   await bash($, w, 'gh pr view 8')
@@ -462,7 +467,7 @@ test('a daemon that answers ping takes every fetch', async ($, on) => {
   await start($, on, w)
   await bash($, w, 'gh pr view 10')
   expect(w.graphql).toHaveLength(0)
-  expect(w.daemonRequests).toEqual([{ version: 1, requestsPerHour: 60, prs: [{ key: 'o/r#10', maxAgeMs: 60_000 }] }])
+  expect(w.daemonRequests).toEqual([{ version: 1, requestsPerHour: 60, prs: [{ key: 'o/r#10', maxAgeMs: 55_000 }] }])
   const ui = await $.ui.mount({
     plugin: 'pr-tracker', surface: 'terminal', component: 'Pane', requestId: 'pr-tracker',
     props: { title: 'Pull requests', isFocused: false, placement: 'dock', bodyColumns: 80 } as never,
@@ -499,8 +504,10 @@ test("one session's fetches never overlap, so neither's results or request are l
   w.hold = new Promise(resolve => (release = resolve))
   const inFlight = new Promise<void>(resolve => (w.entered = resolve))
   await $.tool.call({ tool: 'Bash', command: 'gh pr view 1' })
+  void w.clock.advance(1_000)
   await inFlight
   await $.tool.call({ tool: 'Bash', command: 'gh pr view 2' })
+  void w.clock.advance(1_000)
   // Room for the second fetch to reach gh, were it not queued behind the first.
   for (let i = 0; i < 50; i++) await w.clock.advance(0)
   expect(w.graphql).toHaveLength(1)
@@ -527,13 +534,64 @@ test('a daemon reply that is not a FetchResponse falls back to the built-in coor
   expect(w.graphql).toHaveLength(1)
 })
 
-test('a PR whose first fetch failed is retried within the minute', () => {
+test('how stale a PR may get: a minute while unknown or running, five quiet, longer after failures or when idle', () => {
   const base = {
     key: 'o/r#1', repo: 'o/r', number: 1, title: '', url: '', state: 'UNKNOWN', isDraft: false, mergeable: 'UNKNOWN',
     review: '', pass: 0, fail: 0, pending: 0, skipped: 0, failing: [], running: [],
   }
-  expect(maxAgeMs({ ...base, checkedAt: 0 })).toBe(60_000)
-  expect(maxAgeMs({ ...base, checkedAt: 5, error: 'timeout' })).toBe(60_000)
-  expect(maxAgeMs({ ...base, state: 'OPEN', checkedAt: 5 })).toBe(300_000)
+  const MIN = 60_000
+  expect(maxAgeMs({ ...base, checkedAt: 0 })).toBe(MIN)
+  expect(maxAgeMs({ ...base, checkedAt: 5, error: 'timeout', failures: 1 })).toBe(MIN)
+  expect(maxAgeMs({ ...base, checkedAt: 5, error: 'not found', failures: 3 })).toBe(4 * MIN)
+  expect(maxAgeMs({ ...base, checkedAt: 5, error: 'not found', failures: 20 })).toBe(60 * MIN)
+  expect(maxAgeMs({ ...base, state: 'OPEN', checkedAt: 5, pending: 1 })).toBe(MIN)
+  expect(maxAgeMs({ ...base, state: 'OPEN', checkedAt: 5 })).toBe(5 * MIN)
+  expect(maxAgeMs({ ...base, state: 'OPEN', checkedAt: 5, pending: 1 }, true)).toBe(5 * MIN)
+  expect(maxAgeMs({ ...base, state: 'OPEN', checkedAt: 5 }, true)).toBe(25 * MIN)
   expect(maxAgeMs({ ...base, state: 'MERGED', checkedAt: 5 })).toBeUndefined()
+})
+
+test('PRs named by commands within a second of each other are fetched in one request', async ($, on) => {
+  const w = world(on, 'o/r')
+  await $.tool.call({ tool: 'Bash', command: 'gh pr view 21' })
+  await $.tool.call({ tool: 'Bash', command: 'gh pr checks 22' })
+  await $.tool.call({ tool: 'Bash', command: 'gh pr view 23' })
+  await w.clock.advance(1_000)
+  await w.clock.settle()
+  expect(w.graphql).toHaveLength(1)
+  for (const n of [21, 22, 23]) expect(w.graphql[0]).toContain(`pullRequest(number: ${n})`)
+})
+
+test('while gh cannot reach GitHub at all, a new PR keeps being tried every minute', async ($, on) => {
+  const w = world(on, 'o/r')
+  panes(on).add('pr-tracker')
+  await start($, on, w)
+  w.offline = true
+  await bash($, w, 'gh pr view 41')
+  await w.clock.advance(5 * 60_000)
+  expect(w.graphql).toHaveLength(6)
+})
+
+test('a PR GitHub cannot find is retried less and less often', async ($, on) => {
+  const w = world(on, 'o/r')
+  await start($, on, w)
+  w.missing = [404]
+  await bash($, w, 'gh pr view 404')
+  await w.clock.advance(16 * 60_000)
+  // Every minute would be 17 fetches; backing off 1, 2, 4, 8 minutes makes 5.
+  expect(w.graphql).toHaveLength(5)
+})
+
+test('with the pane closed and nothing happening for ten minutes, polling slows down', async ($, on) => {
+  const w = world(on, 'o/r')
+  panes(on)
+  await start($, on, w)
+  await bash($, w, 'gh pr view 31')
+  await w.clock.advance(10 * 60_000)
+  const busy = w.graphql.length
+  expect(busy).toBeGreaterThanOrEqual(9)
+  await w.clock.advance(3 * 60_000)
+  expect(w.graphql).toHaveLength(busy)
+  await w.clock.advance(3 * 60_000)
+  expect(w.graphql).toHaveLength(busy + 1)
 })

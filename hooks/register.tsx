@@ -10,6 +10,14 @@ const PANE = 'pr-tracker'
 const POLL_MS = 60_000
 /** How stale an open PR with no running checks may get before it is fetched again. */
 const QUIET_POLL_MS = 5 * 60_000
+const MAX_BACKOFF_MS = 60 * 60_000
+/** With the pane closed and no prompt or Bash call for IDLE_MS, healthy PRs poll IDLE_FACTOR times slower. */
+const IDLE_MS = 10 * 60_000
+const IDLE_FACTOR = 5
+/** Newly named PRs wait this long so the ones named close together share one fetch. */
+const GATHER_MS = 1_000
+/** A PR this close to due counts as due, so a poll tick landing just short of it is not skipped. */
+const TICK_SLACK_MS = 5_000
 /** The terminal width from which the fullscreen layout docks a pane beside the transcript. */
 const DOCK_COLUMNS = 110
 /** Below this many body columns the pane drops its cards and header for one line per PR. */
@@ -52,6 +60,7 @@ let daemonCommand: string | undefined
 const lockOwner = Math.random().toString(36).slice(2)
 /** Set while the budget or GitHub holds fetches back. */
 let limited: { until: number; reason: string } | undefined
+let lastActivity = 0
 /** Whether a clickable summary under the prompt stands in for the status line. */
 let summaryInHint = false
 /** The terminal's layout as last seen, for presses that come with no `presentation`. */
@@ -78,11 +87,16 @@ function blank(repo: string, number: number): TrackedPr {
   }
 }
 
-/** How stale a PR may be before it is due: undefined once a merged or closed PR has been fetched. */
-export function maxAgeMs(p: TrackedPr): number | undefined {
-  if (p.checkedAt === 0 || p.state === 'UNKNOWN' || p.pending > 0) return POLL_MS
+/**
+ * How stale a PR may be before it is due: undefined once a merged or closed PR has been fetched.
+ * A PR whose fetches keep failing backs off from POLL_MS, doubling up to MAX_BACKOFF_MS; while
+ * `idle`, healthy PRs wait IDLE_FACTOR times longer.
+ */
+export function maxAgeMs(p: TrackedPr, idle = false): number | undefined {
+  if (p.failures && p.state === 'UNKNOWN') return Math.min(MAX_BACKOFF_MS, POLL_MS * 2 ** (p.failures - 1))
+  if (p.checkedAt === 0 || p.state === 'UNKNOWN') return POLL_MS
   if (p.state === 'MERGED' || p.state === 'CLOSED') return undefined
-  return QUIET_POLL_MS
+  return (p.pending > 0 ? POLL_MS : QUIET_POLL_MS) * (idle ? IDLE_FACTOR : 1)
 }
 
 const GH_TIMEOUT_MS = 30_000
@@ -204,10 +218,13 @@ function apply(list: TrackedPr[], response: FetchResponse): TrackedPr[] {
     const got = response.prs[p.key]
     if (!got || (p.checkedAt !== 0 && got.fetchedAt <= p.checkedAt)) return p
     return got.data
-      ? { ...p, ...got.data, url: got.data.url || p.url, checkedAt: got.fetchedAt, error: undefined }
-      : { ...p, checkedAt: got.fetchedAt, error: got.error }
+      ? { ...p, ...got.data, url: got.data.url || p.url, checkedAt: got.fetchedAt, error: undefined, failures: 0 }
+      : { ...p, checkedAt: got.fetchedAt, error: got.error, failures: (p.failures ?? 0) + (got.transient ? 0 : 1) }
   })
 }
+
+let gathering = false
+const gathered = new Set<string>()
 
 async function track($: Engine, refs: Ref[]) {
   const added: TrackedPr[] = []
@@ -220,7 +237,28 @@ async function track($: Engine, refs: Ref[]) {
   }
   if (added.length === 0) return
   await update($, prs, list => [...list, ...added])
-  await refresh($, { keys: added.map(p => p.key) })
+  for (const p of added) gathered.add(p.key)
+  if (gathering) return
+  gathering = true
+  try {
+    await $.clock.sleep(GATHER_MS)
+  } finally {
+    gathering = false
+  }
+  const keys = [...gathered]
+  gathered.clear()
+  await refresh($, { keys })
+}
+
+async function isIdle($: Engine, now: number) {
+  // A hot reload starts the module afresh without a session.start, so no activity yet means just now.
+  if (lastActivity === 0) lastActivity = now
+  if (now - lastActivity < IDLE_MS) return false
+  try {
+    return !(await isPaneOpen($))
+  } catch {
+    return true
+  }
 }
 
 /**
@@ -231,9 +269,11 @@ async function refresh($: Engine, { keys, force }: { keys?: string[]; force?: bo
   if (!keys && !force && refreshing) return
   if (!keys && !force) refreshing = true
   try {
+    const idle = await isIdle($, await $.clock.now())
     const request = (await read($, prs)).flatMap(p => {
-      const age = force ? 0 : maxAgeMs(p)
-      return age === undefined || (keys && !keys.includes(p.key)) ? [] : [{ key: p.key, maxAgeMs: age }]
+      const age = force ? 0 : maxAgeMs(p, idle)
+      if (age === undefined || (keys && !keys.includes(p.key))) return []
+      return [{ key: p.key, maxAgeMs: Math.max(0, age - TICK_SLACK_MS) }]
     })
     if (request.length === 0) return
     const ask: FetchRequest = { version: 1, requestsPerHour, prs: request }
@@ -448,6 +488,7 @@ export const register: Register = (on, options) => {
       description: 'Track PRs: /prs [add <n|url> | remove <n> | clear | refresh]',
     })
     daemonCommand = (await daemonAnswers($, daemonName)) ? daemonName : undefined
+    lastActivity = await $.clock.now()
     $.clock.every(POLL_MS, () => void refresh($))
     void showStatus($)
     return next(e)
@@ -481,8 +522,14 @@ export const register: Register = (on, options) => {
     return { text: `Unknown: /prs ${verb}. Use add, remove, clear or refresh.` }
   })
 
+  on('prompt.submit', async ($, e, next) => {
+    lastActivity = await $.clock.now()
+    return next(e)
+  })
+
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const ran = await next(e)
+    lastActivity = await $.clock.now()
     const command = e.command
     const refs = refsInCommand(command)
     if (PR_CREATE.test(command) && ran.deny === undefined && ran.isError !== true) {
