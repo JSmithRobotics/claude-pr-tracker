@@ -26,6 +26,8 @@ Needs the [GitHub CLI](https://cli.github.com/) installed and logged in (`gh aut
 
 Each open PR is a card coloured by its CI health, sorted so failing and conflicting PRs come first, with a segmented CI bar and the failing or running check names. Merged and closed PRs fold into a list at the bottom. When the cards do not fit, the rest drop to one line each (the two most urgent always stay cards) and the pane scrolls: `ctrl+x tab` to focus it, then the arrow keys.
 
+Stacked PRs stay together: a tracked PR whose base branch is another tracked PR's head (same repo, not from a fork) is listed right after it, bottom first, so in merge order. The stack sorts by its most urgent PR. The pane heads it `stack on main: #12 → #13 → #14` (two PRs on #12 read `#12 → #13, #12 → #15`), the narrow pane brackets it with `┌ ├ └`, and the classic row joins its chips with `→`. Only tracked PRs are linked: track every PR of a stack to see all of it.
+
 Outside fullscreen the status line summarises the open PRs (`PRs 3 open · 1 failing · 2 running`). The tracked list lasts for the session.
 
 ## GitHub requests

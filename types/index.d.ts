@@ -15,6 +15,11 @@ export type PrData = {
   skipped: number
   failing: string[]
   running: string[]
+  /** The branch it merges into and its own; a PR whose base is another's head stacks on it. Absent from older results. */
+  baseRefName?: string
+  headRefName?: string
+  /** Its head branch is in a fork, so the name says nothing about the base repo's branches. */
+  isCrossRepository?: boolean
 }
 
 /** One PR's latest fetch: its data, or why it has none. */

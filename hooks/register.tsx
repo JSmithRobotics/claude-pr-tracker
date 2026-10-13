@@ -337,6 +337,60 @@ const REVIEW: Record<string, [string, string]> = {
   REVIEW_REQUIRED: ['◔ review required', 'warning'],
 }
 
+/**
+ * Live PRs as stacks: a PR whose base branch is another tracked PR's head (same repo, not from a
+ * fork) stacks on it. Each stack runs bottom first, siblings by number; stacks run most urgent
+ * first, ties in tracking order. A lone PR is a stack of one.
+ */
+export function stacks(live: readonly TrackedPr[]): TrackedPr[][] {
+  const byHead = new Map<string, TrackedPr>()
+  const branch = (p: TrackedPr, name: string) => `${p.repo.toLowerCase()}:${name}`
+  for (const p of live) if (p.headRefName && !p.isCrossRepository) byHead.set(branch(p, p.headRefName), p)
+  const parentOf = (p: TrackedPr) => {
+    const up = p.baseRefName ? byHead.get(branch(p, p.baseRefName)) : undefined
+    return up === p ? undefined : up
+  }
+  const children = new Map<TrackedPr, TrackedPr[]>()
+  for (const p of live) {
+    const up = parentOf(p)
+    if (up) children.set(up, [...(children.get(up) ?? []), p])
+  }
+  const placed = new Set<TrackedPr>()
+  const walk = (p: TrackedPr, into: TrackedPr[]): TrackedPr[] => {
+    if (placed.has(p)) return into
+    placed.add(p)
+    into.push(p)
+    for (const c of [...(children.get(p) ?? [])].sort((a, b) => a.number - b.number)) walk(c, into)
+    return into
+  }
+  const groups = live.filter(p => !parentOf(p)).map(p => walk(p, []))
+  // Bases that form a cycle leave no bottom; such a stack starts from the cycle member reached first.
+  for (const p of live) {
+    if (placed.has(p)) continue
+    const seen = new Set<TrackedPr>()
+    let at = p
+    while (!seen.has(at)) {
+      seen.add(at)
+      at = parentOf(at) ?? at
+    }
+    groups.push(walk(at, []))
+  }
+  const rank = (g: TrackedPr[]) => Math.min(...g.map(p => ORDER.indexOf(health(p))))
+  const first = (g: TrackedPr[]) => Math.min(...g.map(p => live.indexOf(p)))
+  return groups.sort((a, b) => rank(a) - rank(b) || first(a) - first(b))
+}
+
+/** A stack from `stacks()` as `#1 → #2 → #3`; a PR on another than the one before it reads `, #1 → #4`. */
+function stackChain(g: readonly TrackedPr[]): string {
+  return g
+    .map((p, i) => {
+      if (i === 0) return `#${p.number}`
+      const up = g.find(q => q !== p && q.headRefName === p.baseRefName)
+      return up === g[i - 1] || !up ? ` → #${p.number}` : `, #${up.number} → #${p.number}`
+    })
+    .join('')
+}
+
 /** A bar of `width` cells split pass / fail / running / skipped, each segment at least a cell. */
 export function ciBar(p: TrackedPr, width: number): { text: string; color: string }[] {
   const parts: [number, string][] = [
@@ -380,11 +434,11 @@ export const MIN_CARDS = 2
 /**
  * Lays the pane out in `rows`: every open PR is at least one line and never dropped, the most
  * urgent are widened into cards while rows remain (at least MIN_CARDS of them), and a drawing
- * taller than the pane is left to the pane's own scrolling.
+ * taller than the pane is left to the pane's own scrolling. `stackRows` is the stack header rows.
  */
-export function plan(live: TrackedPr[], settled: TrackedPr[], rows: number): Layout {
+export function plan(live: TrackedPr[], settled: TrackedPr[], rows: number, stackRows = 0): Layout {
   const HEADER = 3
-  let budget = rows - HEADER - live.length
+  let budget = rows - HEADER - stackRows - live.length
   let doneLines: Layout['doneLines'] = 'none'
   if (settled.length > 0) {
     doneLines = budget >= 2 + settled.length ? 'list' : 'summary'
@@ -392,7 +446,8 @@ export function plan(live: TrackedPr[], settled: TrackedPr[], rows: number): Lay
   }
   const full = new Set<string>()
   let height = rows - budget
-  for (const [i, p] of live.entries()) {
+  const urgent = [...live].sort((x, y) => ORDER.indexOf(health(x)) - ORDER.indexOf(health(y)))
+  for (const [i, p] of urgent.entries()) {
     const extra = cardRows(p) - 1
     if (i < MIN_CARDS || extra <= budget) {
       full.add(p.key)
@@ -435,12 +490,14 @@ async function openRefusal($: Engine, at: CommandPresentation | undefined): Prom
 /** Cells of the inline row outside the chips: title, both scroll buttons with counts, close. */
 const INLINE_CHROME = 28
 
-/** Cells one PR chip takes inline: glyph, `#n`, CI tally, untrack button and the gap after it. */
-function chipWidth(p: TrackedPr): number {
+/** Cells one PR chip takes inline: any stack arrow, glyph, `#n`, CI tally, untrack button and the gap after it. */
+function chipWidth(p: TrackedPr, stacked: boolean): number {
   const ci = p.pass + p.fail + p.pending + p.skipped
   const tally = ci > 0 ? ` ${p.pass + p.fail + p.skipped}/${ci}` : ''
-  return 2 + 1 + String(p.number).length + tally.length + 2 + 2
+  return (stacked ? 2 : 0) + 2 + 1 + String(p.number).length + tally.length + 2 + 2
 }
+
+const isSettled = (p: TrackedPr) => p.state === 'MERGED' || p.state === 'CLOSED'
 
 /**
  * The chips shown from `offset` (clamped to the list) in `room` cells: always one, then whole chips
@@ -637,9 +694,15 @@ export const register: Register = (on, options) => {
       <Button key={`untrack:${p.key}`} plain dimColor onPress={() => void untrack($, q => q.key === p.key)}>✕</Button>
     )
 
+    const groups = stacks(list.filter(p => !isSettled(p)))
+    const live = groups.flat()
+    const settled = list.filter(isSettled).sort((x, y) => ORDER.indexOf(health(x)) - ORDER.indexOf(health(y)))
+    const above = new Set(groups.flatMap(g => g.slice(1).map(p => p.key)))
+
     if (inline) {
-      const chips = [...list].sort((x, y) => ORDER.indexOf(health(x)) - ORDER.indexOf(health(y)))
-      const { start, end } = chipWindow(chips.map(chipWidth), await read($, chipOffset), e.props.bodyColumns - INLINE_CHROME)
+      const chips = [...live, ...settled]
+      const widths = chips.map(p => chipWidth(p, above.has(p.key)))
+      const { start, end } = chipWindow(widths, await read($, chipOffset), e.props.bodyColumns - INLINE_CHROME)
       return (
         <Box>
           <Text bold color="claude">⌥ PRs </Text>
@@ -654,6 +717,7 @@ export const register: Register = (on, options) => {
               return (
                 <Box marginLeft={1} marginRight={1} flexShrink={1}>
                   <Text wrap="truncate-end">
+                    {above.has(p.key) ? <Text color="inactive">→ </Text> : null}
                     <Text color={ACCENT[kind]} bold>{GLYPH[kind]} </Text>
                     <Link href={p.url}><Text bold color={kind === 'merged' || kind === 'closed' ? 'inactive' : 'suggestion'}>#{p.number}</Text></Link>
                     {ci > 0 ? <Text color="inactive"> {p.pass + p.fail + p.skipped}/{ci}</Text> : null}
@@ -686,9 +750,6 @@ export const register: Register = (on, options) => {
       )
     }
 
-    const sorted = [...list].sort((x, y) => ORDER.indexOf(health(x)) - ORDER.indexOf(health(y)))
-    const live = sorted.filter(p => p.state !== 'MERGED' && p.state !== 'CLOSED')
-    const settled = sorted.filter(p => p.state === 'MERGED' || p.state === 'CLOSED')
     if (e.props.bodyColumns < MINIMAL_COLUMNS) {
       const width = e.props.bodyColumns
       return (
@@ -697,14 +758,16 @@ export const register: Register = (on, options) => {
             <Text bold color="claude">⌥ PRs</Text>
             <Button key="close" plain dimColor hotkey="x" role="dismiss" onPress={() => void closePane($)}>✕</Button>
           </Box>
-          {live.map(p => {
+          {groups.flatMap(g => g.map((p, i) => {
             const kind = health(p)
             const ci = p.pass + p.fail + p.pending + p.skipped
             const tally = ci > 0 ? ` ${p.pass + p.fail + p.skipped}/${ci}` : ''
-            const room = width - String(p.number).length - tally.length - 7
+            const bracket = g.length < 2 ? '' : i === 0 ? '┌ ' : i === g.length - 1 ? '└ ' : '├ '
+            const room = width - String(p.number).length - tally.length - 7 - bracket.length
             return (
               <Box justifyContent="space-between">
                 <Text>
+                  {bracket ? <Text color="inactive">{bracket}</Text> : null}
                   <Text color={ACCENT[kind]} bold>{GLYPH[kind]} </Text>
                   <Link href={p.url}><Text bold color="suggestion">#{p.number}</Text></Link>
                   {room >= 6 ? <Text> {cut(p.title || p.repo, room)}</Text> : null}
@@ -713,7 +776,7 @@ export const register: Register = (on, options) => {
                 {untrackButton(p)}
               </Box>
             )
-          })}
+          }))}
           {settled.length > 0 ? (
             <Text color="inactive">{cut(`done ${settled.map(p => `${GLYPH[health(p)]}#${p.number}`).join(' ')}`, width)}</Text>
           ) : null}
@@ -721,7 +784,7 @@ export const register: Register = (on, options) => {
       )
     }
     const room = e.props.scroll?.bodyRows ?? e.viewport?.rows ?? 40
-    const layout = plan(live, settled, room)
+    const layout = plan(live, settled, room, groups.filter(g => g.length > 1).length)
     const count = (want: Health) => list.filter(p => health(p) === want).length
     const newest = Math.max(...list.map(p => p.checkedAt))
     const clearDone = (
@@ -757,72 +820,79 @@ export const register: Register = (on, options) => {
           </Text>
         </Box>
 
-        {live.map(p => {
-          const kind = health(p)
-          const ci = p.pass + p.fail + p.pending + p.skipped
-          const done = p.pass + p.fail + p.skipped
-          if (!layout.full.has(p.key)) {
+        {groups.flatMap(g => [
+          g.length > 1 ? (
+            <Box paddingX={1}>
+              <Text color="inactive">{cut(`stack on ${g[0]?.baseRefName}: ${stackChain(g)}`, inner)}</Text>
+            </Box>
+          ) : null,
+          ...g.map(p => {
+            const kind = health(p)
+            const ci = p.pass + p.fail + p.pending + p.skipped
+            const done = p.pass + p.fail + p.skipped
+            if (!layout.full.has(p.key)) {
+              return (
+                <Box paddingX={1} justifyContent="space-between">
+                  <Text>
+                    <Text color={ACCENT[kind]} bold>{GLYPH[kind]} </Text>
+                    <Link href={p.url}><Text bold color="suggestion">#{p.number}</Text></Link>
+                    <Text> {cut(p.title || p.repo, Math.max(8, inner - String(p.number).length - 25))}</Text>
+                    {ci > 0 ? <Text>  </Text> : null}
+                    {ciBar(p, 8).map(seg => <Text color={seg.color}>{seg.text}</Text>)}
+                    {ci > 0 ? <Text color="inactive"> {done}/{ci}</Text> : null}
+                  </Text>
+                  {untrackButton(p)}
+                </Box>
+              )
+            }
+            const review = REVIEW[p.review]
+            const barWidth = Math.max(10, Math.min(32, inner - 24))
             return (
-              <Box paddingX={1} justifyContent="space-between">
+              <Box flexDirection="column" borderStyle="round" borderColor={ACCENT[kind]} paddingX={1}>
                 <Text>
                   <Text color={ACCENT[kind]} bold>{GLYPH[kind]} </Text>
                   <Link href={p.url}><Text bold color="suggestion">#{p.number}</Text></Link>
-                  <Text> {cut(p.title || p.repo, Math.max(8, inner - String(p.number).length - 25))}</Text>
-                  {ci > 0 ? <Text>  </Text> : null}
-                  {ciBar(p, 8).map(seg => <Text color={seg.color}>{seg.text}</Text>)}
-                  {ci > 0 ? <Text color="inactive"> {done}/{ci}</Text> : null}
+                  <Text bold> {cut(p.title || p.repo, inner - String(p.number).length - 4)}</Text>
                 </Text>
-                {untrackButton(p)}
-              </Box>
-            )
-          }
-          const review = REVIEW[p.review]
-          const barWidth = Math.max(10, Math.min(32, inner - 24))
-          return (
-            <Box flexDirection="column" borderStyle="round" borderColor={ACCENT[kind]} paddingX={1}>
-              <Text>
-                <Text color={ACCENT[kind]} bold>{GLYPH[kind]} </Text>
-                <Link href={p.url}><Text bold color="suggestion">#{p.number}</Text></Link>
-                <Text bold> {cut(p.title || p.repo, inner - String(p.number).length - 4)}</Text>
-              </Text>
-              <Text>
-                {p.isDraft ? <Text color="subtle">◌ draft</Text> : <Text color="success">● ready</Text>}
-                {review ? <Text color={review[1]}>   {review[0]}</Text> : null}
-                {p.mergeable === 'CONFLICTING' ? <Text color="error" bold>   ⚠ conflicts</Text> : null}
-                {p.mergeable === 'MERGEABLE' && kind === 'green' && p.review === 'APPROVED' ? (
-                  <Text color="success" bold>   ⏎ mergeable</Text>
-                ) : null}
-              </Text>
-              {ci > 0 ? (
                 <Text>
-                  {ciBar(p, barWidth).map(seg => <Text color={seg.color}>{seg.text}</Text>)}
-                  <Text color="inactive"> {done}/{ci} </Text>
-                  <Text color="success">✓{p.pass}</Text>
-                  {p.fail ? <Text color="error"> ✗{p.fail}</Text> : null}
-                  {p.pending ? <Text color="warning"> ◐{p.pending}</Text> : null}
+                  {p.isDraft ? <Text color="subtle">◌ draft</Text> : <Text color="success">● ready</Text>}
+                  {review ? <Text color={review[1]}>   {review[0]}</Text> : null}
+                  {p.mergeable === 'CONFLICTING' ? <Text color="error" bold>   ⚠ conflicts</Text> : null}
+                  {p.mergeable === 'MERGEABLE' && kind === 'green' && p.review === 'APPROVED' ? (
+                    <Text color="success" bold>   ⏎ mergeable</Text>
+                  ) : null}
                 </Text>
-              ) : (
-                <Text color="inactive">no checks reported</Text>
-              )}
-              {p.failing.slice(0, 3).map(name => <Text color="error">  ✗ {cut(name, inner - 4)}</Text>)}
-              {p.failing.length > 3 ? <Text color="error">  … {p.failing.length - 3} more failing</Text> : null}
-              {p.fail === 0 && p.running.length > 0 ? (
-                <Text color="warning">  ◐ {cut(p.running.slice(0, 3).join(' · '), inner - 4)}{p.running.length > 3 ? ` +${p.running.length - 3}` : ''}</Text>
-              ) : null}
-              {p.error ? <Text color="error">  ⚠ {cut(p.error, inner - 4)}</Text> : null}
-              <Box justifyContent="space-between">
-                <Text color="inactive">  {cut(`${p.repo} · checked ${ago(now, p.checkedAt)} ago`, inner - 16)}</Text>
-                <Box>
-                  <Link href={`${p.url}/checks`}><Text color="suggestion">checks</Text></Link>
-                  <Text> </Text>
-                  <Button key={`refresh:${p.key}`} plain dimColor onPress={() => void refresh($, { keys: [p.key], force: true })}>↻</Button>
-                  <Text> </Text>
-                  {untrackButton(p)}
+                {ci > 0 ? (
+                  <Text>
+                    {ciBar(p, barWidth).map(seg => <Text color={seg.color}>{seg.text}</Text>)}
+                    <Text color="inactive"> {done}/{ci} </Text>
+                    <Text color="success">✓{p.pass}</Text>
+                    {p.fail ? <Text color="error"> ✗{p.fail}</Text> : null}
+                    {p.pending ? <Text color="warning"> ◐{p.pending}</Text> : null}
+                  </Text>
+                ) : (
+                  <Text color="inactive">no checks reported</Text>
+                )}
+                {p.failing.slice(0, 3).map(name => <Text color="error">  ✗ {cut(name, inner - 4)}</Text>)}
+                {p.failing.length > 3 ? <Text color="error">  … {p.failing.length - 3} more failing</Text> : null}
+                {p.fail === 0 && p.running.length > 0 ? (
+                  <Text color="warning">  ◐ {cut(p.running.slice(0, 3).join(' · '), inner - 4)}{p.running.length > 3 ? ` +${p.running.length - 3}` : ''}</Text>
+                ) : null}
+                {p.error ? <Text color="error">  ⚠ {cut(p.error, inner - 4)}</Text> : null}
+                <Box justifyContent="space-between">
+                  <Text color="inactive">  {cut(`${p.repo} · checked ${ago(now, p.checkedAt)} ago`, inner - 16)}</Text>
+                  <Box>
+                    <Link href={`${p.url}/checks`}><Text color="suggestion">checks</Text></Link>
+                    <Text> </Text>
+                    <Button key={`refresh:${p.key}`} plain dimColor onPress={() => void refresh($, { keys: [p.key], force: true })}>↻</Button>
+                    <Text> </Text>
+                    {untrackButton(p)}
+                  </Box>
                 </Box>
               </Box>
-            </Box>
-          )
-        })}
+            )
+          }),
+        ])}
         {layout.doneLines === 'list' ? (
           <Box flexDirection="column" paddingX={1} marginTop={1}>
             <Box justifyContent="space-between">

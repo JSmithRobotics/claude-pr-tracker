@@ -2,7 +2,7 @@ import type { On } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 
-import { cardRows, chipWindow, maxAgeMs, MIN_CARDS, opens, plan, refsInCommand, summarise } from '../hooks/register.tsx'
+import { cardRows, chipWindow, maxAgeMs, MIN_CARDS, opens, plan, refsInCommand, stacks, summarise } from '../hooks/register.tsx'
 import type { TrackedPr } from '../types'
 
 const CHECKS = [
@@ -28,6 +28,8 @@ type World = {
   /** `git config` remotes by name; `origin` is the cwd repo unless a test says otherwise. */
   remotes: Record<string, string>
   titles: Record<number, string>
+  /** Each PR's `[base, head]` branches; unset PRs merge `pr-<n>` into main. */
+  branches: Record<number, [string, string]>
   /** PR numbers GitHub does not know: their alias is null with a NOT_FOUND error, and gh exits 1. */
   missing: number[]
   /** While set, every graphql call waits for it, after calling `entered`. */
@@ -40,7 +42,7 @@ function world(on: On, repo = 'kinisi-robotics/kinisi_ros'): World {
   const w: World = {
     files: new Map(), graphql: [], argv: [], statuses: [], clock: mock.clock(on, { now: Date.parse('2026-10-09T12:00:00Z') }), checks: CHECKS,
     rateLimit: { remaining: 4999, resetAt: '2099-01-01T00:00:00Z' }, refuse: false, offline: false, bashStdout: '', daemonRequests: [],
-    remotes: { origin: `git@github.com:${repo}.git` }, titles: {}, missing: [],
+    remotes: { origin: `git@github.com:${repo}.git` }, titles: {}, branches: {}, missing: [],
   }
   const ran = (stdout: string, exitCode = 0, stderr = '') =>
     ({ value: { exitCode, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false } })
@@ -96,6 +98,7 @@ function world(on: On, repo = 'kinisi-robotics/kinisi_ros'): World {
           pullRequest: {
             number: Number(n), title: w.titles[Number(n)] ?? `pr ${n}`, url: `https://github.com/${owner}/${name}/pull/${n}`,
             state: 'OPEN', isDraft: false, mergeable: 'MERGEABLE', reviewDecision: 'APPROVED',
+            baseRefName: w.branches[Number(n)]?.[0] ?? 'main', headRefName: w.branches[Number(n)]?.[1] ?? `pr-${n}`, isCrossRepository: false,
             commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: w.checks } } } }] },
           },
         }
@@ -201,13 +204,60 @@ test('the layout fits a tall pane and keeps every PR, scrolling, in a short one'
   for (const rows of [4, 8, 12, 20]) {
     const l = plan(live, settled, rows)
     expect(l.full.size).toBeGreaterThanOrEqual(MIN_CARDS)
-    expect([...l.full].slice(0, MIN_CARDS)).toEqual(['o/r#1', 'o/r#2'])
+    expect([...l.full].slice(0, MIN_CARDS)).toEqual(['o/r#4', 'o/r#1'])
     expect(l.height).toBe(
       3 + live.reduce((n, p) => n + (l.full.has(p.key) ? cardRows(p) : 1), 0) +
         (l.doneLines === 'list' ? 2 + settled.length : 2),
     )
   }
   expect(plan(live, settled, 8).height).toBeGreaterThan(8)
+  expect(plan(live, settled, 20, 2).height).toBe(plan(live, settled, 20).height + 2)
+})
+
+test('tracked PRs group into stacks by base and head branch, bottom first, the most urgent stack first', () => {
+  const on = (n: number, base: string, over: Partial<TrackedPr> = {}) => pr(n, { baseRefName: base, headRefName: `b${n}`, ...over })
+  const numbers = (groups: TrackedPr[][]) => groups.map(g => g.map(p => p.number))
+  expect(numbers(stacks([on(9, 'main'), on(3, 'b2'), on(1, 'main'), on(2, 'b1')]))).toEqual([[9], [1, 2, 3]])
+  expect(numbers(stacks([on(9, 'main'), on(3, 'b2', { fail: 1 }), on(1, 'main'), on(2, 'b1')]))).toEqual([[1, 2, 3], [9]])
+  expect(numbers(stacks([on(1, 'main'), on(5, 'b1'), on(4, 'b1')]))).toEqual([[1, 4, 5]])
+  expect(numbers(stacks([on(1, 'main', { repo: 'x/y', key: 'x/y#1' }), on(2, 'b1')]))).toEqual([[1], [2]])
+  expect(numbers(stacks([on(1, 'main', { isCrossRepository: true }), on(2, 'b1')]))).toEqual([[1], [2]])
+  expect(numbers(stacks([on(1, 'b2'), on(2, 'b1')]))).toHaveLength(1)
+  expect(numbers(stacks([on(3, 'b1'), on(1, 'b2'), on(2, 'b1')]))[0]?.toSorted()).toEqual([1, 2, 3])
+  expect(numbers(stacks([on(1, 'main', { repo: 'O/R' }), on(2, 'b1')]))).toEqual([[1, 2]])
+  expect(numbers(stacks([pr(1), pr(2)]))).toEqual([[1], [2]])
+})
+
+test('the pane lists a stack bottom first under a header naming it, and the classic row keeps it together', async ($, on) => {
+  panes(on)
+  const w = world(on, 'o/r')
+  w.branches = { 31: ['b32', 'b31'], 32: ['main', 'b32'], 33: ['b31', 'b33'], 34: ['b32', 'b34'] }
+  await bash($, w, 'gh pr view 33 && gh pr view 40 && gh pr view 34 && gh pr view 31 && gh pr view 32')
+  const order = (text: string) => [32, 31, 33, 34, 40].map(n => text.indexOf(`#${n}`)).filter(i => i >= 0)
+  const dock = await $.ui.mount({
+    plugin: 'pr-tracker', surface: 'terminal', component: 'Pane', requestId: 'pr-tracker',
+    props: { title: 'Pull requests', isFocused: false, placement: 'dock', bodyColumns: 80, scroll: { offset: 0, bodyRows: 80 } } as never,
+  })
+  const chain = '#32 → #31 → #33, #32 → #34'
+  expect((await dock.find({ text: /stack on main/ }))?.text).toContain(`stack on main: ${chain}`)
+  const body = ((await dock.find({ text: /Pull requests/ }))?.text ?? '').split(chain)[1] ?? ''
+  expect(order(body)).toEqual([...order(body)].sort((a, b) => a - b))
+  expect(order(body)).toHaveLength(5)
+  await dock.unmount()
+  const narrow = await $.ui.mount({
+    plugin: 'pr-tracker', surface: 'terminal', component: 'Pane', requestId: 'pr-tracker',
+    props: { title: 'Pull requests', isFocused: false, placement: 'dock', bodyColumns: 40 } as never,
+  })
+  expect((await narrow.find({ text: /PRs/ }))?.text).toMatch(/┌[^#├└]*#32[^#]*├[^#]*#31[^#]*├[^#]*#33[^#]*└[^#]*#34[^┌├└]*#40/)
+  await narrow.unmount()
+  const row = await $.ui.mount({
+    plugin: 'pr-tracker', surface: 'terminal', component: 'Pane', requestId: 'pr-tracker',
+    props: { title: 'Pull requests', isFocused: false, placement: 'inline', bodyColumns: 200 } as never,
+    viewport: { columns: 204, rows: 40, isFullscreen: false },
+  })
+  const chips = (await row.find({ text: /PRs/ }))?.text ?? ''
+  expect(chips).toMatch(/#32[^#]*→[^#]*#31[^#]*→[^#]*#33[^#]*→[^#]*#34/)
+  expect(chips).not.toMatch(/→[^#]*#40/)
 })
 
 test('a short pane keeps every PR, the first two as cards, and says it scrolls', async ($, on) => {

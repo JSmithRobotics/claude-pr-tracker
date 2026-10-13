@@ -35,7 +35,7 @@ export function summarise(rollup: readonly Check[]) {
 }
 
 const PR_FIELDS =
-  'number title url state isDraft mergeable reviewDecision commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes { __typename ... on CheckRun { name status conclusion } ... on StatusContext { context state } } } } } } }'
+  'number title url state isDraft mergeable reviewDecision baseRefName headRefName isCrossRepository commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes { __typename ... on CheckRun { name status conclusion } ... on StatusContext { context state } } } } } } }'
 
 /** One GraphQL query for every key (`owner/name#n`, already validated), each PR under alias `p<i>`. */
 export function batchQuery(keys: readonly string[]): string {
@@ -49,6 +49,7 @@ export function batchQuery(keys: readonly string[]): string {
 
 type GraphqlPr = {
   title?: string; url?: string; state?: string; isDraft?: boolean; mergeable?: string; reviewDecision?: string | null
+  baseRefName?: string; headRefName?: string; isCrossRepository?: boolean
   commits?: { nodes?: { commit?: { statusCheckRollup?: { contexts?: { nodes?: Check[] } } | null } }[] }
 }
 
@@ -60,6 +61,9 @@ function prData(pr: GraphqlPr): PrData {
     isDraft: Boolean(pr.isDraft),
     mergeable: pr.mergeable ?? 'UNKNOWN',
     review: pr.reviewDecision ?? '',
+    baseRefName: pr.baseRefName ?? '',
+    headRefName: pr.headRefName ?? '',
+    isCrossRepository: Boolean(pr.isCrossRepository),
     ...summarise(pr.commits?.nodes?.[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? []),
   }
 }
