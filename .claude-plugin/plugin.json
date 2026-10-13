@@ -1,6 +1,5 @@
 {
   "name": "pr-tracker",
-  "version": "0.1.0",
   "description": "A pane tracking the GitHub PRs this session creates or works on: state, review, mergeability and CI progress via gh",
   "types": "./types/index.d.ts",
   "author": {
