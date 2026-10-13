@@ -487,6 +487,24 @@ export const register: Register = (on, options) => {
       name: 'prs',
       description: 'Track PRs: /prs [add <n|url> | remove <n> | clear | refresh]',
     })
+    await $.tool.register({
+      name: 'track_prs',
+      description:
+        "Adds GitHub pull requests to the PR tracker pane and status line (or with untrack: true, removes them). Costs no GitHub request: the tracker fetches them in its next batch. Use it when a task creates, reviews or watches PRs, instead of running gh just to name them.",
+      inputSchema: {
+        type: 'object',
+        properties: {
+          prs: {
+            type: 'array',
+            minItems: 1,
+            items: { type: 'string' },
+            description: 'Each a PR number in the current repo (123 or #123), owner/name#123, or a pull URL.',
+          },
+          untrack: { type: 'boolean', description: 'Remove these PRs from the tracker instead of adding them.' },
+        },
+        required: ['prs'],
+      },
+    })
     daemonCommand = (await daemonAnswers($, daemonName)) ? daemonName : undefined
     lastActivity = await $.clock.now()
     $.clock.every(POLL_MS, () => void refresh($))
@@ -520,6 +538,31 @@ export const register: Register = (on, options) => {
       return { text: refused ?? 'PR tracker opened.' }
     }
     return { text: `Unknown: /prs ${verb}. Use add, remove, clear or refresh.` }
+  })
+
+  on('tool.call', { tool: 'mcp__pr-tracker__track_prs' }, async ($, e) => {
+    const input = e as unknown as { prs?: unknown; untrack?: unknown }
+    const args = Array.isArray(input.prs) ? input.prs.map(String) : []
+    const refs: Ref[] = []
+    const keys: string[] = []
+    const rejected: string[] = []
+    for (const arg of args) {
+      const ref = refFromArg(arg)
+      const repo = ref && (await resolveRepo($, ref.repo))
+      if (!ref || !repo) {
+        rejected.push(arg)
+        continue
+      }
+      refs.push({ repo, number: ref.number })
+      keys.push(`${repo}#${ref.number}`)
+    }
+    const notPrs = rejected.length ? ` Not PRs (or no GitHub repo here): ${rejected.join(', ')}.` : ''
+    if (input.untrack === true) {
+      await untrack($, p => keys.includes(p.key))
+      return { result: { untracked: keys, rejected }, text: `Stopped tracking ${keys.join(', ') || 'nothing'}.${notPrs}` }
+    }
+    if (refs.length > 0) void track($, refs)
+    return { result: { tracked: keys, rejected }, text: `Tracking ${keys.join(', ') || 'nothing'}.${notPrs}` }
   })
 
   on('prompt.submit', async ($, e, next) => {

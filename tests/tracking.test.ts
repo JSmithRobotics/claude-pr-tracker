@@ -111,6 +111,7 @@ function world(on: On, repo = 'kinisi-robotics/kinisi_ros'): World {
 async function start($: Engine, on: On, w: World) {
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
+  on('tool.register', ($, e) => ({ value: { tool: `mcp__pr-tracker__${e.name}` } }))
   await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
   await w.clock.settle()
 }
@@ -594,4 +595,22 @@ test('with the pane closed and nothing happening for ten minutes, polling slows 
   expect(w.graphql).toHaveLength(busy)
   await w.clock.advance(3 * 60_000)
   expect(w.graphql).toHaveLength(busy + 1)
+})
+
+test('a skill tracks and untracks PRs through the track_prs tool, with no request of its own', async ($, on) => {
+  const w = world(on, 'o/r')
+  await start($, on, w)
+  const tracked = await $.tool.call({
+    tool: 'mcp__pr-tracker__track_prs',
+    prs: ['51', 'a/b#52', 'https://github.com/c/d/pull/53', 'not a pr'],
+  } as never)
+  expect(tracked.text).toContain('o/r#51, a/b#52, c/d#53')
+  expect(tracked.text).toContain('not a pr')
+  await w.clock.advance(1_000)
+  await w.clock.settle()
+  expect(w.graphql).toHaveLength(1)
+  for (const n of [51, 52, 53]) expect(w.graphql[0]).toContain(`pullRequest(number: ${n})`)
+  expect(w.statuses.at(-1)).toBe('PRs 3 open · 3 failing · 3 running')
+  await $.tool.call({ tool: 'mcp__pr-tracker__track_prs', prs: ['a/b#52', 'c/d#53'], untrack: true } as never)
+  expect(w.statuses.at(-1)).toBe('PRs 1 open · 1 failing · 1 running')
 })

@@ -22,6 +22,7 @@ Needs the [GitHub CLI](https://cli.github.com/) installed and logged in (`gh aut
 - Docked narrower than 48 columns, the pane shows one line per PR (status, number, CI tally, `✕`) under a single `⌥ PRs ✕` row.
 - PRs are picked up from the session's own shell commands: `gh pr create`, `gh pr view|checks|merge|ready|edit|comment|diff|review|reopen|close <n>`, and any `github.com/<owner>/<repo>/pull/<n>` URL.
 - `/prs add <n | owner/repo#n | url>`, `/prs remove <n>`, `/prs clear`, `/prs refresh`.
+- Claude, and so any skill, can call the `mcp__pr-tracker__track_prs` tool: `{ "prs": ["123", "owner/name#45", "https://github.com/o/r/pull/6"] }` tracks them, adding `"untrack": true` removes them. It costs no GitHub request; the PRs join the next batched fetch. In a skill, a line such as "Call `mcp__pr-tracker__track_prs` with the PRs you create or review" is enough.
 
 Each open PR is a card coloured by its CI health, sorted so failing and conflicting PRs come first, with a segmented CI bar and the failing or running check names. Merged and closed PRs fold into a list at the bottom. When the cards do not fit, the rest drop to one line each (the two most urgent always stay cards) and the pane scrolls: `ctrl+x tab` to focus it, then the arrow keys.
 
