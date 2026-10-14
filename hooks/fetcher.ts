@@ -6,12 +6,40 @@ const REFUSED_PAUSE_MS = 15 * 60_000
 /** Cached PRs nobody asked for in this long are dropped from the shared state. */
 const CACHE_TTL_MS = 24 * HOUR_MS
 
-type Check = { name?: string; context?: string; status?: string; conclusion?: string | null; state?: string }
+type Check = {
+  name?: string; context?: string; status?: string; conclusion?: string | null; state?: string
+  checkSuite?: {
+    conclusion?: string | null
+    workflowRun?: { databaseId?: number; workflow?: { name?: string } } | null
+  } | null
+}
+
+/**
+ * Keeps each workflow's latest run that wasn't cancelled, or its latest run if all were: GitHub keeps every
+ * run on the commit, and a concurrency group can cancel a newer run in favour of an older one still going.
+ */
+function latestRuns(rollup: readonly Check[]): Check[] {
+  const chosen = new Map<string, { id: number; cancelled: boolean }>()
+  for (const c of rollup) {
+    const run = c.checkSuite?.workflowRun
+    const workflow = run?.workflow?.name
+    if (workflow === undefined || run?.databaseId === undefined) continue
+    const candidate = { id: run.databaseId, cancelled: c.checkSuite?.conclusion === 'CANCELLED' }
+    const best = chosen.get(workflow)
+    if (!best || (best.cancelled && !candidate.cancelled) || (best.cancelled === candidate.cancelled && candidate.id > best.id))
+      chosen.set(workflow, candidate)
+  }
+  return rollup.filter(c => {
+    const run = c.checkSuite?.workflowRun
+    const workflow = run?.workflow?.name
+    return workflow === undefined || run?.databaseId === chosen.get(workflow)?.id
+  })
+}
 
 /** Buckets a statusCheckRollup: check runs by status/conclusion, commit statuses by state. */
 export function summarise(rollup: readonly Check[]) {
   const out = { pass: 0, fail: 0, pending: 0, skipped: 0, failing: [] as string[], running: [] as string[] }
-  for (const c of rollup) {
+  for (const c of latestRuns(rollup)) {
     const name = c.name ?? c.context ?? '?'
     const verdict =
       c.state !== undefined
@@ -35,7 +63,7 @@ export function summarise(rollup: readonly Check[]) {
 }
 
 const PR_FIELDS =
-  'number title url state isDraft mergeable reviewDecision baseRefName headRefName isCrossRepository commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes { __typename ... on CheckRun { name status conclusion } ... on StatusContext { context state } } } } } } }'
+  'number title url state isDraft mergeable reviewDecision baseRefName headRefName isCrossRepository commits(last: 1) { nodes { commit { statusCheckRollup { contexts(last: 100) { nodes { __typename ... on CheckRun { name status conclusion checkSuite { conclusion workflowRun { databaseId workflow { name } } } } ... on StatusContext { context state } } } } } } }'
 
 /** One GraphQL query for every key (`owner/name#n`, already validated), each PR under alias `p<i>`. */
 export function batchQuery(keys: readonly string[]): string {

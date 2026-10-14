@@ -187,6 +187,27 @@ test('commit statuses and check runs land in the same buckets', () => {
   ).toEqual({ pass: 2, fail: 2, pending: 1, skipped: 1, failing: ['ci/c', 'z'], running: ['ci/b'] })
 })
 
+test("a workflow run on the same commit more than once counts only as its latest run that wasn't cancelled", () => {
+  const run = (workflow: string, databaseId: number, conclusion: string | null = null) => ({
+    conclusion,
+    workflowRun: { databaseId, workflow: { name: workflow } },
+  })
+  expect(
+    summarise([
+      { name: 'build', status: 'COMPLETED', conclusion: 'CANCELLED', checkSuite: run('CI', 10, 'CANCELLED') },
+      { name: 'publish', status: 'COMPLETED', conclusion: 'CANCELLED', checkSuite: run('CI', 10, 'CANCELLED') },
+      { name: 'build', status: 'COMPLETED', conclusion: 'SUCCESS', checkSuite: run('CI', 20, 'FAILURE') },
+      { name: 'lint', status: 'COMPLETED', conclusion: 'FAILURE', checkSuite: run('CI', 20, 'FAILURE') },
+      { name: 'hil', status: 'IN_PROGRESS', conclusion: null, checkSuite: run('HIL', 11) },
+      { name: 'hil gate', status: 'COMPLETED', conclusion: 'SUCCESS', checkSuite: run('HIL', 21, 'CANCELLED') },
+      { name: 'hil', status: 'COMPLETED', conclusion: 'CANCELLED', checkSuite: run('HIL', 21, 'CANCELLED') },
+      { name: 'smoke', status: 'COMPLETED', conclusion: 'CANCELLED', checkSuite: run('Smoke', 12, 'CANCELLED') },
+      { name: 'smoke', status: 'COMPLETED', conclusion: 'CANCELLED', checkSuite: run('Smoke', 22, 'CANCELLED') },
+      { name: 'external', status: 'COMPLETED', conclusion: 'SUCCESS', checkSuite: null },
+    ]),
+  ).toEqual({ pass: 2, fail: 2, pending: 1, skipped: 0, failing: ['lint', 'smoke'], running: ['hil'] })
+})
+
 function pr(number: number, over: Partial<TrackedPr> = {}): TrackedPr {
   return {
     key: `o/r#${number}`, repo: 'o/r', number, title: `pr ${number}`, url: '', state: 'OPEN', isDraft: false,
