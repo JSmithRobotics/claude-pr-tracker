@@ -616,10 +616,10 @@ export const register: Register = (on, options) => {
     const notPrs = rejected.length ? ` Not PRs (or no GitHub repo here): ${rejected.join(', ')}.` : ''
     if (input.untrack === true) {
       await untrack($, p => keys.includes(p.key))
-      return { result: { untracked: keys, rejected }, text: `Stopped tracking ${keys.join(', ') || 'nothing'}.${notPrs}` }
+      return { result: `Stopped tracking ${keys.join(', ') || 'nothing'}.${notPrs}` }
     }
     if (refs.length > 0) void track($, refs)
-    return { result: { tracked: keys, rejected }, text: `Tracking ${keys.join(', ') || 'nothing'}.${notPrs}` }
+    return { result: `Tracking ${keys.join(', ') || 'nothing'}.${notPrs}` }
   })
 
   on('prompt.submit', async ($, e, next) => {

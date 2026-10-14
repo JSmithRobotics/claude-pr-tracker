@@ -654,8 +654,9 @@ test('a skill tracks and untracks PRs through the track_prs tool, with no reques
     tool: 'mcp__pr-tracker__track_prs',
     prs: ['51', 'a/b#52', 'https://github.com/c/d/pull/53', 'not a pr'],
   } as never)
-  expect(tracked.text).toContain('o/r#51, a/b#52, c/d#53')
-  expect(tracked.text).toContain('not a pr')
+  expect(typeof tracked.result).toBe('string')
+  expect(tracked.result).toContain('o/r#51, a/b#52, c/d#53')
+  expect(tracked.result).toContain('not a pr')
   await w.clock.advance(1_000)
   await w.clock.settle()
   expect(w.graphql).toHaveLength(1)
