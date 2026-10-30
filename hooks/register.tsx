@@ -4,7 +4,11 @@ import type { CommandPresentation, EngineInterface as Engine, Register, RenderSu
 import type { FetchRequest, FetchResponse, TrackedPr } from '../types'
 import { answerOf, asFetchResponse, batchQuery, dueKeys, holdOf, parseBatch, parseState, recordBatch, repoFromRemotes } from './fetcher.ts'
 
+import { createdPrs, createsPr, refsInCommand } from './command.ts'
+import type { Ref } from './command.ts'
+
 export { summarise } from './fetcher.ts'
+export { refsInCommand } from './command.ts'
 
 const PANE = 'pr-tracker'
 const POLL_MS = 60_000
@@ -26,22 +30,7 @@ const MINIMAL_COLUMNS = 48
 const prs = atom({ plugin: 'pr-tracker', key: 'prs' } as const, [] as TrackedPr[])
 const chipOffset = atom({ plugin: 'pr-tracker', key: 'chipOffset' } as const, 0)
 
-type Ref = { repo?: string; number: number }
-
 const PR_URL = /github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)/g
-const PR_VERB =
-  /\bgh\s+pr\s+(?:view|checks|merge|ready|edit|comment|diff|review|reopen|close)\s+#?(\d+)\b/g
-const PR_CREATE = /\bgh\s+pr\s+create\b/
-const REPO_FLAG = /(?:\s-R|\s--repo)[\s=]+([\w.-]+\/[\w.-]+)/
-
-/** The PRs a shell command names: pull URLs, and numbers given to `gh pr <verb>`. */
-export function refsInCommand(command: string): Ref[] {
-  const repo = REPO_FLAG.exec(command)?.[1]
-  const refs: Ref[] = []
-  for (const m of command.matchAll(PR_URL)) refs.push({ repo: m[1], number: Number(m[2]) })
-  for (const m of command.matchAll(PR_VERB)) refs.push({ repo, number: Number(m[1]) })
-  return refs
-}
 
 /** A `/prs add` argument: `123`, `#123`, `owner/name#123` or a pull URL. */
 export function refFromArg(arg: string): Ref | undefined {
@@ -65,17 +54,33 @@ let lastActivity = 0
 let summaryInHint = false
 /** The terminal's layout as last seen, for presses that come with no `presentation`. */
 let terminalLayout: CommandPresentation | undefined
+/** Whether the session has opened the pane on its own yet; it does so once, so a closed pane stays shut. */
+let autoOpened = false
 
-/** The cwd's GitHub repo as gh resolves it, from git's own config, which costs no API request. */
-async function resolveRepo($: Engine, repo?: string): Promise<string | undefined> {
-  if (repo) return repo
-  if (cwdRepo) return cwdRepo
+/** The GitHub repo of each folder a command `cd`s into, as gh resolves it. */
+const dirRepos = new Map<string, string | undefined>()
+
+/** The repo gh resolves in `dir` (the cwd when absent), from git's own config, which costs no API request. */
+async function repoIn($: Engine, dir?: string): Promise<string | undefined> {
   try {
-    const r = await $.process.run(['git', 'config', '--get-regexp', '^remote\\.'], { timeoutMs: 5_000 })
-    if (r.exitCode === 0) cwdRepo = repoFromRemotes(r.stdout)
+    let at = dir
+    if (at?.startsWith('~')) at = `${(await $.env.get('HOME')) ?? '~'}${at.slice(1)}`
+    const argv = at ? ['git', '-C', at, 'config', '--get-regexp', '^remote\\.'] : ['git', 'config', '--get-regexp', '^remote\\.']
+    const r = await $.process.run(argv, { timeoutMs: 5_000 })
+    return r.exitCode === 0 ? repoFromRemotes(r.stdout) : undefined
   } catch {
-    cwdRepo = undefined
+    return undefined
   }
+}
+
+/** A ref's repo: its own, else that of the folder it was named in, else the cwd's. */
+async function resolveRepo($: Engine, ref: Ref): Promise<string | undefined> {
+  if (ref.repo) return ref.repo
+  if (ref.dir !== undefined) {
+    if (!dirRepos.has(ref.dir)) dirRepos.set(ref.dir, await repoIn($, ref.dir))
+    return dirRepos.get(ref.dir)
+  }
+  cwdRepo ??= await repoIn($)
   return cwdRepo
 }
 
@@ -229,7 +234,7 @@ const gathered = new Set<string>()
 async function track($: Engine, refs: Ref[]) {
   const added: TrackedPr[] = []
   for (const ref of refs) {
-    const repo = await resolveRepo($, ref.repo)
+    const repo = await resolveRepo($, ref)
     if (!repo || !(ref.number > 0)) continue
     const key = `${repo}#${ref.number}`
     if ((await read($, prs)).some(p => p.key === key) || added.some(p => p.key === key)) continue
@@ -527,6 +532,12 @@ async function openPane($: Engine, at: CommandPresentation | undefined, focus?: 
   return refused
 }
 
+async function openByDefault($: Engine) {
+  if (autoOpened || (await openRefusal($, terminalLayout))) return
+  autoOpened = true
+  await openPane($, terminalLayout)
+}
+
 function closePane($: Engine) {
   return $.ui.close({ id: PANE }).catch(() => undefined)
 }
@@ -566,6 +577,7 @@ export const register: Register = (on, options) => {
     lastActivity = await $.clock.now()
     $.clock.every(POLL_MS, () => void refresh($))
     void showStatus($)
+    void openByDefault($).catch(() => undefined)
     return next(e)
   })
 
@@ -605,7 +617,7 @@ export const register: Register = (on, options) => {
     const rejected: string[] = []
     for (const arg of args) {
       const ref = refFromArg(arg)
-      const repo = ref && (await resolveRepo($, ref.repo))
+      const repo = ref && (await resolveRepo($, ref))
       if (!ref || !repo) {
         rejected.push(arg)
         continue
@@ -632,10 +644,9 @@ export const register: Register = (on, options) => {
     lastActivity = await $.clock.now()
     const command = e.command
     const refs = refsInCommand(command)
-    if (PR_CREATE.test(command) && ran.deny === undefined && ran.isError !== true) {
-      // gh pr create prints the new PR's URL, so naming it costs no API request.
-      const stdout = String((ran.result as { stdout?: unknown } | undefined)?.stdout ?? '')
-      for (const m of stdout.matchAll(PR_URL)) refs.push({ repo: m[1], number: Number(m[2]) })
+    if (createsPr(command) && ran.deny === undefined && ran.isError !== true) {
+      // gh pr create prints the new PR's URL on a line of its own, so naming it costs no API request.
+      refs.push(...createdPrs(String((ran.result as { stdout?: unknown } | undefined)?.stdout ?? '')))
     }
     if (refs.length > 0) void track($, refs)
     return ran
@@ -646,6 +657,7 @@ export const register: Register = (on, options) => {
     const clickable = e.surface !== 'terminal' || e.viewport?.isFullscreen === true
     if (e.surface === 'terminal' && e.viewport?.isFullscreen !== undefined) {
       terminalLayout = { isFullscreen: e.viewport.isFullscreen, columns: e.viewport.columns }
+      void openByDefault($).catch(() => undefined)
     }
     const text = summary(await read($, prs), (e.viewport?.columns ?? 0) < 120)
     if (e.surface === 'terminal' && clickable !== summaryInHint) {

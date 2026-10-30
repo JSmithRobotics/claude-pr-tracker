@@ -27,6 +27,8 @@ type World = {
   daemonRequests: unknown[]
   /** `git config` remotes by name; `origin` is the cwd repo unless a test says otherwise. */
   remotes: Record<string, string>
+  /** Remotes of other folders, by the path `git -C` is given. */
+  dirRemotes: Record<string, Record<string, string>>
   titles: Record<number, string>
   /** Each PR's `[base, head]` branches; unset PRs merge `pr-<n>` into main. */
   branches: Record<number, [string, string]>
@@ -42,7 +44,7 @@ function world(on: On, repo = 'kinisi-robotics/kinisi_ros'): World {
   const w: World = {
     files: new Map(), graphql: [], argv: [], statuses: [], clock: mock.clock(on, { now: Date.parse('2026-10-09T12:00:00Z') }), checks: CHECKS,
     rateLimit: { remaining: 4999, resetAt: '2099-01-01T00:00:00Z' }, refuse: false, offline: false, bashStdout: '', daemonRequests: [],
-    remotes: { origin: `git@github.com:${repo}.git` }, titles: {}, branches: {}, missing: [],
+    remotes: { origin: `git@github.com:${repo}.git` }, dirRemotes: {}, titles: {}, branches: {}, missing: [],
   }
   const ran = (stdout: string, exitCode = 0, stderr = '') =>
     ({ value: { exitCode, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false } })
@@ -67,6 +69,11 @@ function world(on: On, repo = 'kinisi-robotics/kinisi_ros'): World {
     if (cmd === 'git' && args[0] === 'remote' && args[1] === 'get-url') {
       const url = w.remotes[args[2] ?? '']
       return url ? ran(`${url}\n`) : ran('', 2, 'error: No such remote')
+    }
+    if (cmd === 'git' && args[0] === '-C' && args[2] === 'config') {
+      const remotes = w.dirRemotes[args[1] ?? '']
+      if (!remotes) return ran('', 128, 'fatal: not a git repository')
+      return ran(Object.entries(remotes).map(([name, url]) => `remote.${name}.url ${url}\n`).join(''))
     }
     if (cmd === 'git' && args[0] === 'config') {
       return ran(Object.entries(w.remotes).map(([name, url]) => `remote.${name}.url ${url}\n`).join(''))
@@ -166,12 +173,51 @@ test('the pane draws a tracked PR with its failing check on each surface', async
   }
 })
 
-test('commands name PRs by URL or by the number given to a gh pr verb, nothing else', () => {
-  expect(refsInCommand('gh pr merge 12371 --squash')).toEqual([{ repo: undefined, number: 12371 }])
+test('a command tracks only the PRs a gh pr verb acts on, nothing it merely mentions', () => {
+  expect(refsInCommand('gh pr merge 12371 --squash')).toEqual([{ number: 12371 }])
   expect(refsInCommand('gh pr view 5 -R a/b')).toEqual([{ repo: 'a/b', number: 5 }])
-  expect(refsInCommand('open https://github.com/o/r/pull/9')).toEqual([{ repo: 'o/r', number: 9 }])
+  expect(refsInCommand('gh pr view https://github.com/o/r/pull/9 --json state')).toEqual([{ repo: 'o/r', number: 9 }])
+  expect(refsInCommand("gh pr checks '#7' --watch --interval 60")).toEqual([{ number: 7 }])
+  expect(refsInCommand('gh pr comment --body "see 3" -R o/r 4')).toEqual([{ repo: 'o/r', number: 4 }])
+  expect(refsInCommand('open https://github.com/o/r/pull/9')).toEqual([])
   expect(refsInCommand('gh pr list --limit 30')).toEqual([])
+  expect(refsInCommand('gh pr view my-branch')).toEqual([])
   expect(refsInCommand('gh run view 37802490225')).toEqual([])
+})
+
+test('a pull URL in a --body, --title, heredoc or comment is not tracked', () => {
+  expect(refsInCommand('gh pr edit 12 --body "Follows https://github.com/o/r/pull/11 and #10"')).toEqual([{ number: 12 }])
+  expect(refsInCommand("gh pr comment 12 -R o/r --title 'x' -b 'dup of https://github.com/o/r/pull/3'")).toEqual([{ repo: 'o/r', number: 12 }])
+  expect(refsInCommand('echo "gh pr view 8 https://github.com/o/r/pull/8"  # gh pr view 9')).toEqual([])
+  const heredoc = [
+    "cat > /tmp/handoff.md <<'EOF'",
+    '- https://github.com/o/r/pull/12749 (gh pr view 12749)',
+    'gh pr merge 12754',
+    'EOF',
+    'gh pr checks 5 -R o/r',
+  ].join('\n')
+  expect(refsInCommand(heredoc)).toEqual([{ repo: 'o/r', number: 5 }])
+})
+
+test('each gh invocation in a command takes its own -R; a cd makes a bare number name that folder\'s repo', () => {
+  expect(refsInCommand('gh pr view 1 -R a/b && gh pr checks 2 --repo=c/d; gh pr diff 3 | head')).toEqual([
+    { repo: 'a/b', number: 1 }, { repo: 'c/d', number: 2 }, { number: 3 },
+  ])
+  expect(refsInCommand('ID=$(gh pr view 4 -R a/b --json id) && GH_REPO=e/f gh pr ready 5')).toEqual([
+    { repo: 'a/b', number: 4 }, { repo: 'e/f', number: 5 },
+  ])
+  expect(refsInCommand('cd /src/other && gh pr view 6 && gh pr view 7 -R a/b')).toEqual([
+    { dir: '/src/other', number: 6 }, { repo: 'a/b', number: 7 },
+  ])
+  expect(refsInCommand('cd "$WORK" && gh pr view 8')).toEqual([])
+  expect(refsInCommand("docker exec -w /w c bash -lc 'gh pr view 9 -R a/b; gh pr checks 10'")).toEqual([{ repo: 'a/b', number: 9 }])
+})
+
+test('a bare number after a cd is tracked in the repo of that folder', async ($, on) => {
+  const w = world(on, 'o/r')
+  w.dirRemotes = { '/src/other': { origin: 'git@github.com:x/y.git' } }
+  await bash($, w, 'cd /src/other && gh pr checks 5')
+  expect(w.graphql[0]).toContain('repository(owner: "x", name: "y") { pullRequest(number: 5)')
 })
 
 test('commit statuses and check runs land in the same buckets', () => {
@@ -347,7 +393,7 @@ test('an attached terminal decides where the pane opens: classic mode inline, fu
   }
 })
 
-test('clicking the PR summary under the prompt opens the pane and clicking it again closes it', async ($, on) => {
+test('the pane opens once when it can dock, and clicking the PR summary closes and reopens it', async ($, on) => {
   const open = panes(on)
   on('ui.render', { component: 'PromptHint' }, () => ({ type: 'Text', props: {}, children: ['? for shortcuts'] }) as never)
   const w = await trackOne($, on)
@@ -359,9 +405,39 @@ test('clicking the PR summary under the prompt opens the pane and clicking it ag
   expect((await ui.find({ key: 'prs-toggle' }))?.text).toContain('1 open')
   expect((await ui.find({ text: /for shortcuts/ }))?.text).toBeDefined()
   expect(w.statuses.at(-1)).toBeUndefined()
-  await ui.press({ key: 'prs-toggle' })
   expect(open.has('pr-tracker')).toBe(true)
   await ui.press({ key: 'prs-toggle' })
+  expect(open.has('pr-tracker')).toBe(false)
+  await $.ui.mount({
+    plugin: 'pr-tracker', surface: 'terminal', component: 'PromptHint',
+    props: { isDraft: false, isWorking: false, hint: '? for shortcuts' },
+    viewport: { columns: 140, rows: 40, isFullscreen: true },
+  })
+  expect(open.has('pr-tracker')).toBe(false)
+  await ui.press({ key: 'prs-toggle' })
+  expect(open.has('pr-tracker')).toBe(true)
+})
+
+test('under the classic renderer the pane opens on its own as the PR row, once per session', async ($, on) => {
+  const open = panes(on)
+  on('ui.render', { component: 'PromptHint' }, () => ({ type: 'Text', props: {}, children: ['? for shortcuts'] }) as never)
+  await trackOne($, on)
+  const hint = () => $.ui.mount({
+    plugin: 'pr-tracker', surface: 'terminal', component: 'PromptHint',
+    props: { isDraft: false, isWorking: false, hint: '? for shortcuts' },
+    viewport: { columns: 80, rows: 40, isFullscreen: false },
+  })
+  await hint()
+  expect(open.has('pr-tracker')).toBe(true)
+  const ui = await $.ui.mount({
+    plugin: 'pr-tracker', surface: 'terminal', component: 'Pane', requestId: 'pr-tracker',
+    props: { title: 'Pull requests', isFocused: false, placement: 'inline', bodyColumns: 80 } as never,
+    viewport: { columns: 80, rows: 40, isFullscreen: false },
+  })
+  expect(await ui.find({ text: /#12371/ })).toBeDefined()
+  expect(open.has('pr-tracker')).toBe(true)
+  await ui.press({ key: 'close' })
+  await hint()
   expect(open.has('pr-tracker')).toBe(false)
 })
 
@@ -452,6 +528,22 @@ test('every PR a command names is fetched in one gh call, with no other GitHub r
   expect(w.graphql).toHaveLength(1)
   for (const n of [1, 2, 3, 4, 5, 6]) expect(w.graphql[0]).toContain(`pullRequest(number: ${n})`)
   expect(w.argv.filter(a => a[0] === 'gh' && a[1] !== 'api')).toEqual([])
+})
+
+test('gh pr create tracks only the URL it prints for the new PR, not links echoed from its body', async ($, on) => {
+  const w = world(on, 'o/r')
+  w.bashStdout = 'Follows https://github.com/o/r/pull/70\nhttps://github.com/o/r/pull/77\n'
+  await bash($, w, 'gh pr create --title t --body "Follows https://github.com/o/r/pull/70" && cat body.md')
+  expect(w.graphql).toHaveLength(1)
+  expect(w.graphql[0]).toContain('pullRequest(number: 77)')
+  expect(w.graphql[0]).not.toContain('pullRequest(number: 70)')
+})
+
+test('a command that only mentions gh pr create reads nothing from its output', async ($, on) => {
+  const w = world(on, 'o/r')
+  w.bashStdout = 'https://github.com/o/r/pull/77\n'
+  await bash($, w, "echo 'run gh pr create next'")
+  expect(w.graphql).toHaveLength(0)
 })
 
 test('a PR another session fetched recently is reused, and a lock another session holds fetches nothing', async ($, on) => {
