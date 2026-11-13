@@ -12,7 +12,7 @@
       "type": "number",
       "title": "GitHub requests per hour",
       "description": "The most gh requests the tracker makes in any hour, shared by every Claude session on this machine. Each request fetches every due PR at once.",
-      "default": 60,
+      "default": 180,
       "min": 1
     },
     "daemonCommand": {

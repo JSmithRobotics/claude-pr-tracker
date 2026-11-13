@@ -2,7 +2,10 @@ import { atom, read, update } from 'claude-code'
 import type { CommandPresentation, EngineInterface as Engine, Register, RenderSurface } from 'claude-code'
 
 import type { FetchRequest, FetchResponse, TrackedPr } from '../types'
-import { answerOf, asFetchResponse, batchQuery, dueKeys, holdOf, parseBatch, parseState, recordBatch, repoFromRemotes } from './fetcher.ts'
+import {
+  answerOf, asFetchResponse, batchQuery, dueKeys, holdOf, parseBatch, parseState, parseWants, publishWants, recordBatch,
+  repoFromRemotes, withWants,
+} from './fetcher.ts'
 
 import { createdPrs, createsPr, refsInCommand } from './command.ts'
 import type { Ref } from './command.ts'
@@ -42,7 +45,7 @@ export function refFromArg(arg: string): Ref | undefined {
 
 let cwdRepo: string | undefined
 let refreshing = false
-let requestsPerHour = 60
+let requestsPerHour = 180
 /** The daemon command when it answered `ping` at session start; otherwise the built-in coordinator fetches. */
 let daemonCommand: string | undefined
 /** This session's name on the shared lock. */
@@ -107,6 +110,8 @@ export function maxAgeMs(p: TrackedPr, idle = false): number | undefined {
 const GH_TIMEOUT_MS = 30_000
 /** Outlasts a gh call, so a live holder never loses the lock mid-fetch. */
 const LEASE_MS = 45_000
+/** A session's published wants outlive a few missed poll ticks, then lapse when it is gone. */
+const WANTS_TTL_MS = 3 * POLL_MS
 
 async function cacheDir($: Engine): Promise<string> {
   const own = await $.env.get('CLAUDE_PR_TRACKER_DIR')
@@ -152,21 +157,38 @@ let coordinatorTail: Promise<unknown> = Promise.resolve()
  * Each applies its batch to the state it re-reads just before writing, so a race costs a request,
  * and a state file caught mid-write is never taken for an empty one.
  */
-function viaCoordinator($: Engine, request: FetchRequest): Promise<FetchResponse> {
-  const run = coordinatorTail.then(() => coordinate($, request))
+function viaCoordinator($: Engine, request: FetchRequest, publish: boolean): Promise<FetchResponse> {
+  const run = coordinatorTail.then(() => coordinate($, request, publish))
   coordinatorTail = run.catch(() => undefined)
   return run
 }
 
-async function coordinate($: Engine, request: FetchRequest): Promise<FetchResponse> {
+/**
+ * Once something is due, the fetch takes every PR any live session polls for that comes due before
+ * the next tick, so sessions ticking at different moments fall into one schedule and a PR costs one
+ * request per interval however many sessions run. `publish` records `request` as this session's
+ * wants; only a full poll does, so a forced refresh or a narrowed fetch never changes what others
+ * fetch. The wants file is read-modify-write without the lock: a lost update only costs a request.
+ */
+async function coordinate($: Engine, request: FetchRequest, publish: boolean): Promise<FetchResponse> {
   const dir = await cacheDir($)
   const statePath = `${dir}/state.json`
   const lockPath = `${dir}/lock.json`
+  const wantsPath = `${dir}/wants.json`
   const now = await $.clock.now()
+  const wants = parseWants(await readJson($, wantsPath), now + WANTS_TTL_MS)
+  if (publish) {
+    try {
+      await $.fs.write(wantsPath, JSON.stringify(publishWants(wants, lockOwner, request, now, now + WANTS_TTL_MS)))
+    } catch {
+      // Publishing is best-effort; this session still fetches its own PRs.
+    }
+  }
+  const all = withWants(request, wants, lockOwner, now)
   const first = await readShared($, statePath)
   let state = first === 'corrupt' ? parseState(undefined) : first
   const hold = () => holdOf(state, now, requestsPerHour)
-  if (first === 'corrupt' || dueKeys(state, request, now).length === 0 || hold().limitedUntil) {
+  if (first === 'corrupt' || dueKeys(state, all, now).length === 0 || hold().limitedUntil) {
     return answerOf(state, request, hold())
   }
   const lock = (await readJson($, lockPath)) as { owner?: string; until?: number } | undefined
@@ -179,7 +201,7 @@ async function coordinate($: Engine, request: FetchRequest): Promise<FetchRespon
     const locked = await readShared($, statePath)
     if (locked === 'corrupt') return answerOf(state, request, hold())
     state = locked
-    const keys = dueKeys(state, request, now)
+    const keys = dueKeys(state, all, now, POLL_MS)
     if (keys.length === 0 || hold().limitedUntil) return answerOf(state, request, hold())
     let ran
     try {
@@ -284,7 +306,7 @@ async function refresh($: Engine, { keys, force }: { keys?: string[]; force?: bo
     const ask: FetchRequest = { version: 1, requestsPerHour, prs: request }
     let response: FetchResponse | undefined
     if (daemonCommand) response = await viaDaemon($, daemonCommand, ask)
-    response ??= await viaCoordinator($, ask)
+    response ??= await viaCoordinator($, ask, !keys && !force)
     limited = response.limitedUntil ? { until: response.limitedUntil, reason: response.reason ?? '' } : undefined
     if (force && limited) $.ui.toast(`gh is held back (${limited.reason}) for ${until(await $.clock.now(), limited.until)}.`)
     await update($, prs, list => apply(list, response))
@@ -547,7 +569,7 @@ async function isPaneOpen($: Engine) {
 }
 
 export const register: Register = (on, options) => {
-  requestsPerHour = Math.max(1, Number(options.requestsPerHour ?? 60))
+  requestsPerHour = Math.max(1, Number(options.requestsPerHour ?? 180))
   const daemonName = String(options.daemonCommand ?? 'pr-tracker-daemon')
 
   on('session.start', async ($, e, next) => {

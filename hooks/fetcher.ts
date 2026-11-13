@@ -147,9 +147,41 @@ export function parseState(raw: unknown): SharedState {
   }
 }
 
-/** The requested PRs whose shared result is older than they allow. */
-export function dueKeys(s: SharedState, request: FetchRequest, now: number): string[] {
-  return request.prs.filter(r => now - (s.prs[r.key]?.fetchedAt ?? -Infinity) >= r.maxAgeMs).map(r => r.key)
+/** What each session on the machine polls for, by session: each PR's maxAgeMs, kept until `until`. */
+export type Wants = Record<string, { until: number; prs: Record<string, number> }>
+
+/**
+ * A wants file's well-formed entries: keys are queried as they stand and sessions may run other
+ * versions of the mod, so a bad key or age is dropped, and so is an entry promising to live past `latest`.
+ */
+export function parseWants(raw: unknown, latest: number): Wants {
+  if (!raw || typeof raw !== 'object') return {}
+  return Object.fromEntries(Object.entries(raw as Wants).flatMap(([owner, w]) => {
+    if (typeof w?.until !== 'number' || w.until > latest || !w.prs || typeof w.prs !== 'object') return []
+    const prs = Object.entries(w.prs).filter(([key, age]) => /^[\w.-]+\/[\w.-]+#\d+$/.test(key) && Number.isFinite(age) && age >= 0)
+    return [[owner, { until: w.until, prs: Object.fromEntries(prs) }]]
+  }))
+}
+
+/** The live wants with `owner`'s replaced by `request`'s PRs until `until`. */
+export function publishWants(wants: Wants, owner: string, request: FetchRequest, now: number, until: number): Wants {
+  const live = Object.entries(wants).filter(([o, w]) => o !== owner && w.until > now)
+  return Object.fromEntries([...live, [owner, { until, prs: Object.fromEntries(request.prs.map(p => [p.key, p.maxAgeMs])) }]])
+}
+
+/** `request` widened by every other live session's wants, each PR at the shortest maxAgeMs asked for it. */
+export function withWants(request: FetchRequest, wants: Wants, owner: string, now: number): FetchRequest {
+  const ages = new Map(request.prs.map(p => [p.key, p.maxAgeMs]))
+  for (const [o, w] of Object.entries(wants)) {
+    if (o === owner || w.until <= now) continue
+    for (const [key, age] of Object.entries(w.prs)) ages.set(key, Math.min(age, ages.get(key) ?? Infinity))
+  }
+  return { ...request, prs: [...ages].map(([key, maxAgeMs]) => ({ key, maxAgeMs })) }
+}
+
+/** The requested PRs whose shared result is older than they allow, or will be within `earlyMs`. */
+export function dueKeys(s: SharedState, request: FetchRequest, now: number, earlyMs = 0): string[] {
+  return request.prs.filter(r => now - (s.prs[r.key]?.fetchedAt ?? -Infinity) >= r.maxAgeMs - earlyMs).map(r => r.key)
 }
 
 /** Why a fetch must wait, and until when; empty when one may go now. */

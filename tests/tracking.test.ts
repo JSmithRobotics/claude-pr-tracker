@@ -561,6 +561,28 @@ test('a PR another session fetched recently is reused, and a lock another sessio
   expect(w.graphql).toHaveLength(0)
 })
 
+test("a session's fetch takes every PR another live session wants, and publishes its own", async ($, on) => {
+  const w = world(on, 'o/r')
+  await start($, on, w)
+  const now = w.clock.now()
+  // 90 is half a minute from due: taken now, the other session's next tick finds it fresh and fetches nothing.
+  cached(w, { 'a/b#90': { fetchedAt: now - 30_000, title: 'theirs' } })
+  w.files.set('/cache/wants.json', JSON.stringify({
+    live: { until: now + 2 * 60_000, prs: { 'a/b#90': 55_000, 'bad': 55_000, 'a/b#92': null } },
+    gone: { until: now - 1, prs: { 'a/b#91': 55_000 } },
+    stuck: { until: now + 24 * HOUR, prs: { 'a/b#93': 55_000 } },
+  }))
+  await bash($, w, 'gh pr view 5')
+  expect(w.graphql).toHaveLength(1)
+  expect(w.graphql[0]).toContain('pullRequest(number: 90)')
+  expect(w.graphql[0]).not.toMatch(/number: (91|92|93|\))/)
+  expect(Object.keys(JSON.parse(w.files.get('/cache/wants.json') ?? '{}'))).toEqual(['live', 'gone', 'stuck'])
+  await w.clock.advance(60_000)
+  const wants = JSON.parse(w.files.get('/cache/wants.json') ?? '{}')
+  expect(Object.keys(wants)).not.toContain('gone')
+  expect(Object.values(wants).map(s => (s as { prs: object }).prs)).toContainEqual({ 'o/r#5': 55_000 })
+})
+
 test('the hourly budget is shared through the cache and refills as requests age out', { options: { requestsPerHour: 2 } }, async ($, on) => {
   const w = world(on, 'o/r')
   await start($, on, w)
@@ -631,7 +653,7 @@ test('a daemon that answers ping takes every fetch', async ($, on) => {
   await start($, on, w)
   await bash($, w, 'gh pr view 10')
   expect(w.graphql).toHaveLength(0)
-  expect(w.daemonRequests).toEqual([{ version: 1, requestsPerHour: 60, prs: [{ key: 'o/r#10', maxAgeMs: 55_000 }] }])
+  expect(w.daemonRequests).toEqual([{ version: 1, requestsPerHour: 180, prs: [{ key: 'o/r#10', maxAgeMs: 55_000 }] }])
   const ui = await $.ui.mount({
     plugin: 'pr-tracker', surface: 'terminal', component: 'Pane', requestId: 'pr-tracker',
     props: { title: 'Pull requests', isFocused: false, placement: 'dock', bodyColumns: 80 } as never,
