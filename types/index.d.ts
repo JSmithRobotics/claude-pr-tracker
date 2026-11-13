@@ -68,6 +68,8 @@ declare module 'claude-code' {
   interface PluginState {
     'pr-tracker': {
       prs: TrackedPr[]
+      /** The session id of the conversation `prs` belongs to; empty before the list has one. */
+      prsOwner: string
       /** Index of the first PR chip shown in the one-row inline view. */
       chipOffset: number
     }

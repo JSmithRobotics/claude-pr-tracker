@@ -37,6 +37,12 @@ type World = {
   /** While set, every graphql call waits for it, after calling `entered`. */
   hold?: Promise<void>
   entered?: () => void
+  /** The conversation's id, as `$.session.id()` answers; `/clear` and `/resume` change it. */
+  sessionId: string
+  /** The plugin's `$.store`, kept across sessions. */
+  store: Map<string, unknown>
+  /** How many of the next `$.store.get()` calls throw. */
+  storeFailures: number
 }
 
 // Everything outside the mod: a cache dir in memory, a git remote, gh answering GraphQL by alias, a daemon.
@@ -45,10 +51,26 @@ function world(on: On, repo = 'kinisi-robotics/kinisi_ros'): World {
     files: new Map(), graphql: [], argv: [], statuses: [], clock: mock.clock(on, { now: Date.parse('2026-10-09T12:00:00Z') }), checks: CHECKS,
     rateLimit: { remaining: 4999, resetAt: '2099-01-01T00:00:00Z' }, refuse: false, offline: false, bashStdout: '', daemonRequests: [],
     remotes: { origin: `git@github.com:${repo}.git` }, dirRemotes: {}, titles: {}, branches: {}, missing: [],
+    sessionId: 'conversation-a', store: new Map(), storeFailures: 0,
   }
   const ran = (stdout: string, exitCode = 0, stderr = '') =>
     ({ value: { exitCode, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false } })
   on('env.get', ($, e) => ({ value: e.name === 'CLAUDE_PR_TRACKER_DIR' ? '/cache' : undefined }))
+  on('session.id', () => ({ value: w.sessionId }))
+  on('session.end', ($, e) => ({ sessionId: e.sessionId }))
+  on('store.get', ($, e) => {
+    if (w.storeFailures > 0 && w.storeFailures--) throw new Error('store unavailable')
+    return { value: w.store.get(e.key) }
+  })
+  on('store.set', ($, e) => {
+    w.store.set(e.key, JSON.parse(JSON.stringify(e.value)))
+    return { value: undefined }
+  })
+  on('store.delete', ($, e) => {
+    w.store.delete(e.key)
+    return { value: undefined }
+  })
+  on('store.keys', () => ({ value: [...w.store.keys()] }))
   on('fs.read', ($, e) => {
     const text = w.files.get(e.path)
     if (text === undefined) throw new Error(`ENOENT: ${e.path}`)
@@ -581,6 +603,49 @@ test("a session's fetch takes every PR another live session wants, and publishes
   const wants = JSON.parse(w.files.get('/cache/wants.json') ?? '{}')
   expect(Object.keys(wants)).not.toContain('gone')
   expect(Object.values(wants).map(s => (s as { prs: object }).prs)).toContainEqual({ 'o/r#5': 55_000 })
+})
+
+test('each conversation keeps its own tracked PRs, back when it is resumed', async ($, on) => {
+  const w = world(on, 'o/r')
+  await start($, on, w)
+  const pane = () => $.ui.mount({
+    plugin: 'pr-tracker', surface: 'terminal', component: 'Pane', requestId: 'pr-tracker',
+    props: { title: 'Pull requests', isFocused: false, placement: 'dock', bodyColumns: 80 } as never,
+  })
+  await bash($, w, 'gh pr view 5')
+  expect(w.statuses.at(-1)).toBe('PRs 1 open · 1 failing · 1 running')
+  await $.session.end({ reason: 'clear', sessionId: 'conversation-a', resume: { id: 'conversation-a' } })
+  w.sessionId = 'conversation-b'
+  await w.clock.advance(1_000)
+  let ui = await pane()
+  expect(await ui.find({ text: /pr 5/ })).toBeUndefined()
+  await ui.unmount()
+  await bash($, w, 'gh pr view 6')
+  // An id that changes with no session.end, and a store that fails mid-switch: the switch is retried, not b's list kept under c.
+  w.sessionId = 'conversation-c'
+  w.storeFailures = 1
+  const refused = await $.tool.call({ tool: 'mcp__pr-tracker__track_prs', prs: ['7'] } as never)
+  expect(refused.result).toContain('Could not track o/r#7')
+  await bash($, w, 'gh pr view 7')
+  expect(w.store.get('session:conversation-c')).toEqual({ savedAt: expect.any(Number), keys: ['o/r#7'] })
+  expect(w.store.get('session:conversation-b')).toEqual({ savedAt: expect.any(Number), keys: ['o/r#6'] })
+  await $.session.end({ reason: 'resume', sessionId: 'conversation-c', resume: { id: 'conversation-c' } })
+  w.sessionId = 'conversation-a'
+  await w.clock.advance(1_000)
+  ui = await pane()
+  expect((await ui.find({ text: /pr 5/ }))?.text).toBeDefined()
+  expect(await ui.find({ text: /pr 6/ })).toBeUndefined()
+})
+
+test('claude --resume brings back the conversation\'s PRs, and lists unused for 30 days are dropped', async ($, on) => {
+  const w = world(on, 'o/r')
+  const now = w.clock.now()
+  w.store.set('session:conversation-a', { savedAt: now - 29 * 24 * HOUR, keys: ['o/r#5', 'a/b#7'] })
+  w.store.set('session:old', { savedAt: now - 31 * 24 * HOUR, keys: ['o/r#9'] })
+  await start($, on, w)
+  expect(w.statuses.at(-1)).toBe('PRs 2 open · 2 failing · 2 running')
+  expect(w.graphql).toHaveLength(1)
+  expect([...w.store.keys()]).toEqual(['session:conversation-a'])
 })
 
 test('the hourly budget is shared through the cache and refills as requests age out', { options: { requestsPerHour: 2 } }, async ($, on) => {

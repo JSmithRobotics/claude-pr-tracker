@@ -31,6 +31,7 @@ const DOCK_COLUMNS = 110
 const MINIMAL_COLUMNS = 48
 
 const prs = atom({ plugin: 'pr-tracker', key: 'prs' } as const, [] as TrackedPr[])
+const prsOwner = atom({ plugin: 'pr-tracker', key: 'prsOwner' } as const, '')
 const chipOffset = atom({ plugin: 'pr-tracker', key: 'chipOffset' } as const, 0)
 
 const PR_URL = /github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)/g
@@ -87,7 +88,10 @@ async function resolveRepo($: Engine, ref: Ref): Promise<string | undefined> {
   return cwdRepo
 }
 
-function blank(repo: string, number: number): TrackedPr {
+/** An unfetched PR for a valid `owner/name#n` key. */
+function blankOf(key: string): TrackedPr {
+  const [repo = '', n = ''] = key.split('#')
+  const number = Number(n)
   return {
     key: `${repo}#${number}`, repo, number, title: '', url: `https://github.com/${repo}/pull/${number}`,
     state: 'UNKNOWN', isDraft: false, mergeable: 'UNKNOWN', review: '',
@@ -253,18 +257,28 @@ function apply(list: TrackedPr[], response: FetchResponse): TrackedPr[] {
 let gathering = false
 const gathered = new Set<string>()
 
-async function track($: Engine, refs: Ref[]) {
-  const added: TrackedPr[] = []
+/** Whether the PRs were added; the new ones are fetched together after GATHER_MS. */
+async function track($: Engine, refs: Ref[]): Promise<boolean> {
+  const named: string[] = []
   for (const ref of refs) {
     const repo = await resolveRepo($, ref)
-    if (!repo || !(ref.number > 0)) continue
-    const key = `${repo}#${ref.number}`
-    if ((await read($, prs)).some(p => p.key === key) || added.some(p => p.key === key)) continue
-    added.push(blank(repo, ref.number))
+    if (repo && ref.number > 0) named.push(`${repo}#${ref.number}`)
   }
-  if (added.length === 0) return
-  await update($, prs, list => [...list, ...added])
-  for (const p of added) gathered.add(p.key)
+  let added: string[] = []
+  try {
+    await changeList($, list => {
+      added = [...new Set(named)].filter(key => !list.some(p => p.key === key))
+      return [...list, ...added.map(blankOf)]
+    })
+  } catch {
+    return false
+  }
+  if (added.length > 0) void gather($, added)
+  return true
+}
+
+async function gather($: Engine, added: string[]) {
+  for (const key of added) gathered.add(key)
   if (gathering) return
   gathering = true
   try {
@@ -296,6 +310,7 @@ async function refresh($: Engine, { keys, force }: { keys?: string[]; force?: bo
   if (!keys && !force && refreshing) return
   if (!keys && !force) refreshing = true
   try {
+    await changeList($).catch(() => undefined)
     const idle = await isIdle($, await $.clock.now())
     const request = (await read($, prs)).flatMap(p => {
       const age = force ? 0 : maxAgeMs(p, idle)
@@ -332,9 +347,88 @@ async function showStatus($: Engine) {
   return $.ui.status(summaryInHint ? undefined : summary(await read($, prs)))
 }
 
-async function untrack($: Engine, drop: (p: TrackedPr) => boolean) {
-  await update($, prs, list => list.filter(p => !drop(p)))
+const SAVED_PREFIX = 'session:'
+const SAVED_TTL_MS = 30 * 24 * 60 * 60_000
+const SAVED_KEY = /^[\w.-]+\/[\w.-]+#\d+$/
+const STORE_FAILED = "the tracker's store could not be read; try again."
+
+/** An in-use conversation's saved list is rewritten this often, so no session's pruning takes it for unused. */
+const RESAVE_MS = 24 * 60 * 60_000
+
+let lastSave = { what: '', at: 0 }
+let listTail: Promise<unknown> = Promise.resolve()
+
+function queued<T>(step: () => Promise<T>): Promise<T> {
+  const run = listTail.then(step)
+  listTail = run.catch(() => undefined)
+  return run
+}
+
+/**
+ * The one way the tracked list changes membership: in a queue, made to the current conversation's
+ * list and saved under that conversation's id. `/clear` and `/resume` change the session id without
+ * a session.start, so each step first loads whichever conversation is current; with no `change` it
+ * only does that. Rejects only when the switch to another conversation fails, which the next step retries.
+ */
+function changeList($: Engine, change?: (list: TrackedPr[]) => TrackedPr[]): Promise<void> {
+  return queued(async () => {
+    const id = await follow($)
+    if (change) await update($, prs, change)
+    await saveList($, id)
+    if (change) await showStatus($)
+  })
+}
+
+/** Best effort: a failed save leaves `lastSave` as it was, so the next step tries again. */
+async function saveList($: Engine, id: string) {
+  try {
+    const keys = (await read($, prs)).map(p => p.key)
+    const now = await $.clock.now()
+    const what = [id, ...keys].join(' ')
+    if (what === lastSave.what && now - lastSave.at < RESAVE_MS) return
+    if (keys.length === 0) await $.store.delete(SAVED_PREFIX + id)
+    else await $.store.set(SAVED_PREFIX + id, { savedAt: now, keys })
+    lastSave = { what, at: now }
+  } catch {}
+}
+
+/**
+ * Makes the list the current conversation's and returns its id. The list's owner lives in `$.state`
+ * beside it, so a reload never mistakes whose list it holds. A list with no owner yet (from a version
+ * that saved none) is adopted when the conversation has nothing saved.
+ */
+async function follow($: Engine): Promise<string> {
+  const id = await $.session.id()
+  const owner = await read($, prsOwner)
+  if (id === owner) return id
+  const saved = (await $.store.get(SAVED_PREFIX + id)) as { keys?: unknown } | undefined
+  if (saved !== undefined || owner !== '') {
+    const keys = Array.isArray(saved?.keys) ? saved.keys.filter((k): k is string => typeof k === 'string' && SAVED_KEY.test(k)) : []
+    await update($, prs, list => keys.map(key => list.find(p => p.key === key) ?? blankOf(key)))
+  }
+  await update($, prsOwner, () => id)
   await showStatus($)
+  void pruneSaved($, id)
+  const keys = (await read($, prs)).map(p => p.key)
+  if (keys.length > 0) void refresh($, { keys })
+  return id
+}
+
+/** Drops other conversations' lists unsaved for SAVED_TTL_MS; best effort. */
+async function pruneSaved($: Engine, current: string) {
+  try {
+    const now = await $.clock.now()
+    for (const key of await $.store.keys()) {
+      if (!key.startsWith(SAVED_PREFIX) || key === SAVED_PREFIX + current) continue
+      const at = ((await $.store.get(key)) as { savedAt?: unknown } | undefined)?.savedAt
+      if (!(typeof at === 'number' && now - at < SAVED_TTL_MS)) await $.store.delete(key)
+    }
+  } catch {}
+}
+
+/** Whether the change was made; false when switching to the current conversation's list failed. */
+async function untrack($: Engine, drop: (p: TrackedPr) => boolean): Promise<boolean> {
+  return changeList($, list => list.filter(p => !drop(p))).then(() => true, () => false)
 }
 
 type Health = 'failing' | 'conflict' | 'running' | 'green' | 'draft' | 'quiet' | 'merged' | 'closed'
@@ -598,6 +692,7 @@ export const register: Register = (on, options) => {
     daemonCommand = (await daemonAnswers($, daemonName)) ? daemonName : undefined
     lastActivity = await $.clock.now()
     $.clock.every(POLL_MS, () => void refresh($))
+    await changeList($).catch(() => undefined)
     void showStatus($)
     void openByDefault($).catch(() => undefined)
     return next(e)
@@ -609,17 +704,19 @@ export const register: Register = (on, options) => {
     if (verb === 'add') {
       const ref = refFromArg(arg)
       if (!ref) return { text: `Not a PR: ${arg}` }
-      await track($, [ref])
+      if (!(await track($, [ref]))) return { text: `Could not track ${arg}: ${STORE_FAILED}` }
       const refused = await openPane($, e.presentation)
       return { text: refused ? `Tracking ${arg}. ${refused}` : `Tracking ${arg}.` }
     }
     if (verb === 'remove') {
       const ref = refFromArg(arg)
-      await untrack($, p => Boolean(ref && p.number === ref.number && (!ref.repo || p.repo === ref.repo)))
+      if (!(await untrack($, p => Boolean(ref && p.number === ref.number && (!ref.repo || p.repo === ref.repo))))) {
+        return { text: `Could not stop tracking ${arg}: ${STORE_FAILED}` }
+      }
       return { text: `Stopped tracking ${arg}.` }
     }
     if (verb === 'clear') {
-      await untrack($, () => true)
+      if (!(await untrack($, () => true))) return { text: `Could not clear the tracked PRs: ${STORE_FAILED}` }
       return { text: 'Cleared the tracked PRs.' }
     }
     if (verb === 'refresh' || verb === '') {
@@ -648,17 +745,26 @@ export const register: Register = (on, options) => {
       keys.push(`${repo}#${ref.number}`)
     }
     const notPrs = rejected.length ? ` Not PRs (or no GitHub repo here): ${rejected.join(', ')}.` : ''
+    const list = keys.join(', ') || 'nothing'
     if (input.untrack === true) {
-      await untrack($, p => keys.includes(p.key))
-      return { result: `Stopped tracking ${keys.join(', ') || 'nothing'}.${notPrs}` }
+      if (!(await untrack($, p => keys.includes(p.key)))) return { result: `Could not stop tracking ${list}: ${STORE_FAILED}` }
+      return { result: `Stopped tracking ${list}.${notPrs}` }
     }
-    if (refs.length > 0) void track($, refs)
-    return { result: `Tracking ${keys.join(', ') || 'nothing'}.${notPrs}` }
+    if (refs.length > 0 && !(await track($, refs))) return { result: `Could not track ${list}: ${STORE_FAILED}` }
+    return { result: `Tracking ${list}.${notPrs}` }
   })
 
   on('prompt.submit', async ($, e, next) => {
     lastActivity = await $.clock.now()
+    await changeList($).catch(() => undefined)
     return next(e)
+  })
+
+  on('session.end', async ($, e, next) => {
+    const ended = await next(e)
+    // No session.start follows a /clear or /resume: load the next conversation's list now, not at the next prompt.
+    if (e.reason === 'clear' || e.reason === 'resume') $.clock.after(1_000, () => void changeList($).catch(() => undefined))
+    return ended
   })
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {

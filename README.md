@@ -28,7 +28,7 @@ Each open PR is a card coloured by its CI health, sorted so failing and conflict
 
 Stacked PRs stay together: a tracked PR whose base branch is another tracked PR's head (same repo, not from a fork) is listed right after it, bottom first, so in merge order. The stack sorts by its most urgent PR. The pane heads it `stack on main: #12 → #13 → #14` (two PRs on #12 read `#12 → #13, #12 → #15`), the narrow pane brackets it with `┌ ├ └`, and the classic row joins its chips with `→`. Only tracked PRs are linked: track every PR of a stack to see all of it.
 
-Outside fullscreen the status line summarises the open PRs (`PRs 3 open · 1 failing · 2 running`). The tracked list lasts for the session.
+Outside fullscreen the status line summarises the open PRs (`PRs 3 open · 1 failing · 2 running`). Each conversation keeps its own tracked list: `/clear` starts an empty one, and resuming a conversation (`claude --resume`, `/resume`) brings its list back, refetched (from the shared cache when another session fetched those PRs in the last minute). Lists are kept in the plugin's store and dropped after 30 days unused.
 
 ## GitHub requests
 
