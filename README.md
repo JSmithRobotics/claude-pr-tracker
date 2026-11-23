@@ -16,7 +16,7 @@ Needs the [GitHub CLI](https://cli.github.com/) installed and logged in (`gh aut
 
 ## Use
 
-- The pane opens on its own once per session, the first time it can; once you close it, it stays shut until `/prs`. `/prs` opens the pane. In classic (main-screen) mode it opens as one row above the prompt with the PRs side by side (status, number, CI tally, `✕`); `‹`/`›` (`h`/`l`) scroll it sideways and `✕` (`x`) closes it. In fullscreen it docks on the right of the transcript from 110 columns, and closes if the terminal narrows below that; the desktop app docks it when no terminal is attached.
+- The pane opens on its own once per session, the first time it can; once you close it, it stays shut until `/prs`. `/prs` opens the pane. In fullscreen it docks on the right of the transcript from 110 columns; narrower, and in classic (main-screen) mode, it opens as one row above the prompt with the PRs side by side (status, number, CI tally, `✕`); `‹`/`›` (`h`/`l`) scroll it sideways and `✕` (`x`) closes it. Classic mode takes no mouse clicks at all, so there close it from the keyboard: `ctrl+x x`, or `ctrl+x tab` to focus the row and then `x`. The desktop app docks it when no terminal is attached.
 - In fullscreen the summary sits clickable at the end of the hint line under the prompt (`⌥ PRs 3 open · 1 failing`): click it to open the pane, click again to close it.
 - In the pane, click a PR number to open it on GitHub, `checks` for its checks page, `↻` to refetch it and `✕` to stop tracking it; the header has `refresh` (`r`) and `close` (`x`), and the done list `clear`.
 - Docked narrower than 48 columns, the pane shows one line per PR (status, number, CI tally, `✕`) under a single `⌥ PRs ✕` row.

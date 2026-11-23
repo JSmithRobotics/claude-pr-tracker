@@ -25,8 +25,6 @@ const IDLE_FACTOR = 5
 const GATHER_MS = 1_000
 /** A PR this close to due counts as due, so a poll tick landing just short of it is not skipped. */
 const TICK_SLACK_MS = 5_000
-/** The terminal width from which the fullscreen layout docks a pane beside the transcript. */
-const DOCK_COLUMNS = 110
 /** Below this many body columns the pane drops its cards and header for one line per PR. */
 const MINIMAL_COLUMNS = 48
 
@@ -591,21 +589,19 @@ function ago(now: number, at: number) {
 }
 
 /**
- * Whether the pane may open. Panes are session-wide and a narrow fullscreen terminal closes the pane
- * rather than seat it inline, so an attached terminal decides: classic (main screen) mode opens it
- * inline above the prompt, fullscreen docks it on the right from DOCK_COLUMNS wide. Without one, an
- * attached desktop or IDE docks it. `at` describes the terminal alone.
+ * Whether the pane may open. An attached terminal decides once it has said its layout: the engine
+ * docks the pane on the right of a wide fullscreen terminal and seats it as the row above the prompt
+ * otherwise. Without one, an attached desktop or IDE docks it; the mobile app alone places none.
  */
 export function opens(at: CommandPresentation | undefined, surfaces: readonly RenderSurface[]): boolean {
-  if (surfaces.includes('terminal')) return at !== undefined && (!at.isFullscreen || at.columns >= DOCK_COLUMNS)
+  if (surfaces.includes('terminal')) return at !== undefined
   return surfaces.some(s => s === 'desktop' || s === 'vscode')
 }
 
 /** Why the pane will not open, or undefined when it opens. */
 async function openRefusal($: Engine, at: CommandPresentation | undefined): Promise<string | undefined> {
   if (opens(at, await $.session.surfaces())) return undefined
-  const now = at ? `now ${at.columns}` : 'the terminal has not said how wide it is'
-  return `In fullscreen the PR pane docks on the right only, from ${DOCK_COLUMNS} columns (${now}). The status line still tracks.`
+  return at ? 'Nothing attached here shows panes. The status line still tracks.' : 'The terminal has not said its layout yet; try again in a moment.'
 }
 
 /** Cells of the inline row outside the chips: title, both scroll buttons with counts, close. */
@@ -811,13 +807,7 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Link, Button } = $.ui.resolve(e)
-    // A fullscreen terminal reseats a docked pane inline when it narrows below DOCK_COLUMNS. Placement
-    // is per surface, so only that terminal closes it; classic mode and phones draw it inline.
     const inline = e.props.placement === 'inline'
-    if (inline && e.surface === 'terminal' && e.viewport?.isFullscreen === true) {
-      void closePane($)
-      return <Text color="inactive">In fullscreen the PR pane docks on the right only.</Text>
-    }
     const list = await read($, prs)
     const now = await $.clock.now()
     const inner = Math.max(20, (e.props.bodyColumns ?? 80) - 4)

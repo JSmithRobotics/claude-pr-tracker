@@ -372,37 +372,37 @@ test('a short pane keeps every PR, the first two as cards, and says it scrolls',
   expect(await tall.find({ text: /ctrl\+x tab/ })).toBeUndefined()
 })
 
-test('inline above the prompt the pane draws its PR row, but a narrow fullscreen terminal closes it', async ($, on) => {
+test('inline above the prompt the pane draws its PR row and stays open, a narrow fullscreen terminal included', async ($, on) => {
   const open = panes(on)
   await trackOne($, on)
   const seats = [
-    ['mobile', undefined, true],
-    ['terminal', { columns: 80, rows: 40, isFullscreen: false }, true],
-    ['terminal', { columns: 100, rows: 40, isFullscreen: true }, false],
+    ['mobile', undefined],
+    ['terminal', { columns: 80, rows: 40, isFullscreen: false }],
+    ['terminal', { columns: 60, rows: 30, isFullscreen: true }],
   ] as const
-  for (const [surface, viewport, stays] of seats) {
+  for (const [surface, viewport] of seats) {
     open.add('pr-tracker')
     const ui = await $.ui.mount({
       plugin: 'pr-tracker', surface, component: 'Pane', requestId: 'pr-tracker',
-      props: { title: 'Pull requests', isFocused: false, placement: 'inline', bodyColumns: 76 } as never,
+      props: { title: 'Pull requests', isFocused: false, placement: 'inline', bodyColumns: 56 } as never,
       ...(viewport ? { viewport } : {}),
     })
-    expect(open.has('pr-tracker')).toBe(stays)
-    expect((await ui.find({ text: /#12371/ }))?.text !== undefined).toBe(stays)
+    expect(open.has('pr-tracker')).toBe(true)
+    expect((await ui.find({ text: /#12371/ }))?.text).toBeDefined()
     expect(await ui.findAll({ key: 'refresh:kinisi-robotics/kinisi_ros#12371' })).toHaveLength(0)
+    await ui.press({ key: 'close' })
+    expect(open.has('pr-tracker')).toBe(false)
     await ui.unmount()
   }
 })
 
-test('an attached terminal decides where the pane opens: classic mode inline, fullscreen docked from 110 columns', () => {
+test('an attached terminal at any width or layout opens the pane once it has said its layout', () => {
   const cases: [boolean, number, ('terminal' | 'desktop' | 'mobile' | 'vscode')[], boolean][] = [
-    [true, 110, ['terminal'], true],
-    [true, 109, ['terminal'], false],
+    [true, 140, ['terminal'], true],
+    [true, 60, ['terminal'], true],
     [false, 200, ['terminal'], true],
     [false, 80, ['terminal', 'mobile'], true],
-    [false, 80, ['terminal', 'desktop'], true],
-    [true, 100, ['terminal', 'desktop'], false],
-    [true, 140, ['terminal', 'desktop'], true],
+    [true, 60, ['terminal', 'desktop'], true],
     [false, 80, ['desktop'], true],
     [false, 80, ['mobile'], false],
     [false, 80, ['vscode'], true],
